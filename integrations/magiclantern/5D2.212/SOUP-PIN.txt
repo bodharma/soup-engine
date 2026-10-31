@@ -1,0 +1,4 @@
+Experimental Soup Engine 5D Mark II port.
+Commit ed3e7c0dfacfdeaf3349dee73edf9e3621217462
+Canon firmware 2.1.2, Magic Lantern 2025_release_01.
+https://github.com/reticulatedpines/magiclantern_simplified

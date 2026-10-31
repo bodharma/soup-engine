@@ -369,8 +369,8 @@ static void fdct(int32_t *d)
         tmp10 = tmp0 + tmp3; tmp13 = tmp0 - tmp3;
         tmp11 = tmp1 + tmp2; tmp12 = tmp1 - tmp2;
 
-        p[0] = (tmp10 + tmp11) << PASS1_BITS;
-        p[4] = (tmp10 - tmp11) << PASS1_BITS;
+        p[0] = (tmp10 + tmp11) * (1 << PASS1_BITS);
+        p[4] = (tmp10 - tmp11) * (1 << PASS1_BITS);
 
         z1 = (tmp12 + tmp13) * FIX_0_541196100;
         p[2] = DESCALE(z1 + tmp13 * FIX_0_765366865, CONST_BITS - PASS1_BITS);
@@ -544,12 +544,7 @@ se_err se_jpeg_begin(se_jpeg *j, int width, int height, int quality,
     memset(j, 0, sizeof *j);
     build_all_codes();
 
-    /* 4:2:2 MCUs are 16 pixels wide. The 50D playback decoder rejects a
-     * width that is not a multiple of 16. Drop the extra columns. */
     j->stride = width;
-    if (width & 15) width &= ~15;
-    if (height & 7) height &= ~7;
-    if (width <= 0 || height <= 0) return SE_E_BADFILE;
 
     j->sink = sink; j->ctx = ctx;
     j->width = width; j->height = height;

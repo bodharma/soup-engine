@@ -9,3 +9,7 @@ src/ml/payload/mlstub-loader.bin
 src/ml/payload/mlstub-hook.bin
 src/ml/payload/soupeng.bin
 src/ml/build/
+src/vendor/
+src/**/*.o
+src/**/*.d
+src/filmdev

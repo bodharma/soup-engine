@@ -1409,7 +1409,7 @@ static int count_sink(void *ctx, const uint8_t *d, size_t n)
     size_t i;
     (void)ctx;
     for (i = 0; i < n; i++) {
-        g_sink_last = (g_sink_last << 8) | d[i];
+        g_sink_last = ((g_sink_last & 0xff) << 8) | d[i];
         g_sink_bytes++;
         if (g_sink_bytes == 2 && (g_sink_last & 0xffff) == 0xffd8) g_sink_soi = 1;
     }
@@ -1969,7 +1969,7 @@ static int jh_encode(const uint8_t *rgb, int w, int h, int q)
 
 static int jh_decode(int scale, int w, int h, uint8_t *dst, int *ow, int *oh)
 {
-    static uint8_t arena_mem[4u << 20];
+    static uint64_t arena_mem[(4u << 20) / sizeof(uint64_t)];
     se_arena ar;
     se_jdec_info info;
     (void)w; (void)h;
@@ -2011,17 +2011,31 @@ static int test_jpeg_half(void)
         if (wf > 2) ok = 0;
     }
 
-    /* --- 2. an odd size rounds up rather than dropping a column -------- */
-    for (y = 0; y < 37; y++)
-        for (x = 0; x < 61; x++)
-            for (c = 0; c < 3; c++)
-                rgb[(y * 61 + x) * 3 + c] = (uint8_t)(40 + x + y);
-    if (!jh_encode(rgb, 61, 37, 90)) { free(g_jh_buf); return 0; }
-    if (!jh_decode(2, 61, 37, half, &ow, &oh) || ow != 31 || oh != 19) {
-        printf("        61x37 at half size: decoded %dx%d, wanted 31x19\n", ow, oh);
-        ok = 0;
-    } else {
-        printf("        61x37 at half size: %dx%d, all rows delivered\n", ow, oh);
+    /* Hard edges check geometry and bounds; reduced IDCT is not a box filter. */
+    {
+        const int sizes[][2] = { {1, 1}, {15, 7}, {17, 9}, {61, 37} };
+        size_t i;
+        for (i = 0; i < SE_ARRAY_LEN(sizes); i++) {
+            int w = sizes[i][0], h = sizes[i][1];
+            int hw = (w + 1) / 2, hh = (h + 1) / 2;
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++)
+                    for (c = 0; c < 3; c++)
+                        rgb[(y * w + x) * 3 + c] =
+                            (uint8_t)(40 + ((x + y) * 2 & 63));
+            if (!jh_encode(rgb, w, h, 90)) { free(g_jh_buf); return 0; }
+            memset(full, 0xa5, sizeof full);
+            memset(half, 0xa5, sizeof half);
+            if (!jh_decode(1, w, h, full, &ow, &oh) || ow != w || oh != h)
+                ok = 0;
+            if (!jh_decode(2, w, h, half, &ow, &oh) || ow != hw || oh != hh)
+                ok = 0;
+            for (c = 0; c < 8; c++)
+                if (full[w * h * 3 + c] != 0xa5 ||
+                    half[hw * hh * 3 + c] != 0xa5) ok = 0;
+            printf("        %dx%d at half size: %dx%d, wanted %dx%d\n",
+                   w, h, ow, oh, hw, hh);
+        }
     }
 
     /* --- 3. smooth content agrees with the full decode, averaged ------- */
@@ -2030,7 +2044,7 @@ static int test_jpeg_half(void)
             uint8_t *p = rgb + (size_t)(y * W + x) * 3;
             p[0] = (uint8_t)(30 + x * 3);
             p[1] = (uint8_t)(200 - y * 3);
-            p[2] = (uint8_t)(90 + ((x + y) * 2 & 63));
+            p[2] = (uint8_t)(90 + x + y);
         }
     if (!jh_encode(rgb, W, H, 96)) { free(g_jh_buf); return 0; }
     if (!jh_decode(1, W, H, full, &ow, &oh) || ow != W || oh != H) ok = 0;
