@@ -7,9 +7,11 @@ have not been validated on a physical camera.
 
 ## Shooting and playback
 
-1. `Shoot → Soup Film → Enable` starts OFF on every boot. Enable before taking
-   a new photo. Classic Chrome is the initial stock. Use sRGB and a colour
-   Canon Picture Style; a monochrome source cannot regain colour.
+1. Highlight `Shoot → Soup Film` and press SET to open its controls. `Enable`
+   starts OFF on every boot; set it ON before taking a new photo. `Stock` opens
+   the film-name picker. On the 5D Mark II, Pict.Style returns from that picker
+   to the Enable/Stock controls. Classic Chrome is the initial stock. Use sRGB
+   and a colour Canon Picture Style; a monochrome source cannot regain colour.
 2. Full RAW uses its embedded JPEG; JPEG-only uses the camera JPEG. RAW+JPEG
    prefers the JPEG and applies one look to both the indexed JPEG and the
    CR2's main JPEG preview and thumbnail.

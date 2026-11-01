@@ -71,6 +71,7 @@ static void soup_catalog(void)
 static struct menu_entry soup_menu[] = {
     {
         .name = "Soup Film",
+        .select = menu_open_submenu,
         .help = "Update PLAY after processing. Originals backed up in ML/SOUP.",
         .children = (struct menu_entry[]) {
             {
