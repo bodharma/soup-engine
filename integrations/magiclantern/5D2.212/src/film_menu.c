@@ -68,6 +68,11 @@ static void soup_catalog(void)
     }
 }
 
+static MENU_UPDATE_FUNC(soup_status_display)
+{
+    MENU_SET_VALUE("%s", soup_status_text());
+}
+
 static struct menu_entry soup_menu[] = {
     {
         .name = "Soup Film",
@@ -87,6 +92,11 @@ static struct menu_entry soup_menu[] = {
                 .choices = soup_choices,
                 .help = "Looks from ML/FILM/INDEX.TXT. Use sRGB colour photos.",
             },
+            {
+                .name = "Status",
+                .update = soup_status_display,
+                .help = "Last processing phase/return code. Details: ML/SOUP/DIAG.TXT.",
+            },
             MENU_EOL,
         },
     },
@@ -104,6 +114,11 @@ static void soup_init(void *unused)
         int recovery;
         do {
             recovery = soup_recover_pending();
+            if (recovery && recovery != SOUP_RECOVERY_BUSY) {
+                if (recovery < 0) soup_diag_fail("boot recovery", recovery);
+                else soup_diag_phase("boot recovery", recovery);
+                soup_diag_flush();
+            }
             if (recovery == SOUP_RECOVERY_BUSY) msleep(250);
         } while (recovery == SOUP_RECOVERY_BUSY);
         soup_recovery_ready = recovery >= 0;

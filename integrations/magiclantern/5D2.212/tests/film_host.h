@@ -16,7 +16,7 @@ FILE *FIO_CreateFile(const char *);
 int FIO_ReadFile(FILE *, void *, size_t);
 int FIO_WriteFile(FILE *, const void *, size_t);
 void FIO_CloseFile(FILE *);
-int FIO_SeekSkipFile(FILE *, int, int);
+int64_t FIO_SeekSkipFile(FILE *, int64_t, int);
 int FIO_RemoveFile(const char *);
 int FIO_RenameFile(const char *, const char *);
 int FIO_CreateDirectory(const char *);

@@ -10,9 +10,116 @@
 #endif
 #include "crc32.h"
 #include <stddef.h>
+#include <stdarg.h>
 
 /* 5D2.212 ROM 0xFFB92AE0: create=0x100, exclusive=0x400; ML's POSIX values differ. */
 #define SOUP_NEW_FILE_FLAGS (O_RDWR | 0x100u | 0x400u)
+
+static char soup_status[64] = "Ready";
+static char soup_events[512];
+static char soup_source[SOUP_PATH], soup_backup[SOUP_PATH], soup_stage[SOUP_PATH];
+static unsigned soup_event_bytes;
+static int soup_diag_number, soup_diag_failed, soup_diag_dirty;
+static FILE *soup_probe_handle;
+
+static void soup_diag_event(const char *format, ...)
+{
+    char line[112];
+    va_list ap;
+    unsigned n, drop = 0;
+    va_start(ap, format);
+    vsnprintf(line, sizeof(line) - 1, format, ap);
+    va_end(ap);
+    line[sizeof(line) - 1] = 0;
+    n = (unsigned)strlen(line);
+    if (soup_event_bytes + n >= sizeof(soup_events)) {
+        drop = soup_event_bytes + n - (sizeof(soup_events) - 1);
+        while (drop < soup_event_bytes && soup_events[drop - 1] != '\n') drop++;
+        for (unsigned i = 0; i < soup_event_bytes - drop; i++) soup_events[i] = soup_events[i + drop];
+        soup_event_bytes -= drop;
+    }
+    memcpy(soup_events + soup_event_bytes, line, n);
+    soup_event_bytes += n;
+    soup_events[soup_event_bytes] = 0;
+    soup_diag_dirty = 1;
+}
+
+const char *soup_status_text(void) { return soup_status; }
+
+void soup_diag_begin(int number)
+{
+    soup_diag_number = number;
+    soup_event_bytes = 0; soup_events[0] = 0;
+    soup_source[0] = soup_backup[0] = soup_stage[0] = 0;
+    soup_diag_failed = 0;
+    snprintf(soup_status, sizeof(soup_status), "Starting rc=0");
+    soup_diag_dirty = 1;
+}
+
+void soup_diag_paths(const char *source, const char *backup, const char *stage)
+{
+    snprintf(soup_source, sizeof(soup_source), "%s", source ? source : "");
+    snprintf(soup_backup, sizeof(soup_backup), "%s", backup ? backup : "");
+    snprintf(soup_stage, sizeof(soup_stage), "%s", stage ? stage : "");
+    soup_diag_dirty = 1;
+}
+
+void soup_diag_phase(const char *phase, int rc)
+{
+    if (soup_diag_failed) return;
+    snprintf(soup_status, sizeof(soup_status), "%s rc=%d", phase, rc);
+    if (!soup_probe_handle) soup_diag_event("%s=%d\n", phase, rc);
+    if (rc < 0) soup_diag_failed = 1;
+    soup_diag_dirty = 1;
+}
+
+void soup_diag_fail(const char *phase, int rc)
+{
+    if (!soup_diag_failed) {
+        snprintf(soup_status, sizeof(soup_status), "%s rc=%d", phase, rc);
+        soup_diag_failed = 1;
+        soup_diag_dirty = 1;
+    }
+}
+
+/* Only this pre-existing owned report may be updated; logger errors are ignored. */
+void soup_diag_flush(void)
+{
+    static const char cookie[] = "SOUP_DIAGNOSTIC_V1\n";
+    static const char path[] = "ML/SOUP/DIAG.TXT";
+    uint32_t size = 0;
+    uint8_t *buffer;
+    FILE *f;
+    unsigned at, room, start = 0;
+    int read_count, written;
+    if (!soup_diag_dirty || FIO_GetFileSize(path, &size) || size != 512) return;
+    buffer = fio_malloc(512);
+    if (!buffer) return;
+    f = FIO_OpenFile(path, O_RDONLY);
+    if (!f) { fio_free(buffer); return; }
+    read_count = FIO_ReadFile(f, buffer, 512);
+    FIO_CloseFile(f);
+    if (read_count != 512 || memcmp(buffer, cookie, sizeof(cookie) - 1)) { fio_free(buffer); return; }
+    memset(buffer, 0, 512);
+    at = (unsigned)snprintf((char *)buffer, 512,
+        "%sStatus: %s\nShot: %d\nSource: %s\nBackup: %s\nStage: %s\n",
+        cookie, soup_status, soup_diag_number, soup_source, soup_backup, soup_stage);
+    if (at >= 512) { fio_free(buffer); return; }
+    room = 511 - at;
+    if (soup_event_bytes > room) {
+        start = soup_event_bytes - room;
+        while (start < soup_event_bytes && soup_events[start - 1] != '\n') start++;
+    }
+    memcpy(buffer + at, soup_events + start, soup_event_bytes - start);
+    /* Reopen at byte zero so diagnostics do not depend on the seek under investigation. */
+    if (FIO_GetFileSize(path, &size) || size != 512) { fio_free(buffer); return; }
+    f = FIO_OpenFile(path, O_RDWR);
+    if (!f) { fio_free(buffer); return; }
+    written = FIO_WriteFile(f, buffer, 512);
+    FIO_CloseFile(f);
+    if (written == 512) soup_diag_dirty = 0;
+    fio_free(buffer);
+}
 
 static int soup_lock(void)
 {
@@ -53,11 +160,20 @@ int soup_component(const char *text, int min, int max)
 int soup_read_at(FILE *f, uint32_t offset, void *dst, uint32_t bytes)
 {
     uint32_t done = 0;
-    if (offset > SOUP_MAX_FILE || bytes > SOUP_MAX_FILE - offset ||
-        FIO_SeekSkipFile(f, offset, 0) < 0) return -1;
+    int64_t seek;
+    if (offset > SOUP_MAX_FILE || bytes > SOUP_MAX_FILE - offset) return -1;
+    soup_diag_phase("read seek", 0);
+    seek = FIO_SeekSkipFile(f, offset, 0);
+    if (f == soup_probe_handle) soup_diag_event("seekR=%08x:%08x\n", (unsigned)((uint64_t)seek >> 32), (unsigned)seek);
+    if (seek < 0) {
+        if (f != soup_probe_handle) soup_diag_event("read seek64=%08x:%08x\n", (unsigned)((uint64_t)seek >> 32), (unsigned)seek);
+        soup_diag_fail("read seek", (int32_t)seek); return -1;
+    }
     while (done < bytes) {
+        soup_diag_phase("read", 0);
         int got = FIO_ReadFile(f, (uint8_t *)dst + done, bytes - done);
-        if (got <= 0 || (uint32_t)got > bytes - done) return -1;
+        if (f == soup_probe_handle) soup_diag_event("read=%d/%u\n", got, (unsigned)(bytes - done));
+        if (got <= 0 || (uint32_t)got > bytes - done) { soup_diag_fail("read", got); return -1; }
         done += (uint32_t)got;
     }
     return 0;
@@ -66,14 +182,23 @@ int soup_read_at(FILE *f, uint32_t offset, void *dst, uint32_t bytes)
 int soup_write_at(FILE *f, uint32_t offset, const void *src, uint32_t bytes)
 {
     uint32_t done = 0;
-    if (offset > SOUP_MAX_FILE || bytes > SOUP_MAX_FILE - offset ||
-        FIO_SeekSkipFile(f, offset, 0) < 0) return -1;
+    int64_t seek;
+    if (offset > SOUP_MAX_FILE || bytes > SOUP_MAX_FILE - offset) return -1;
+    soup_diag_phase("write seek", 0);
+    seek = FIO_SeekSkipFile(f, offset, 0);
+    if (f == soup_probe_handle) soup_diag_event("seekW=%08x:%08x\n", (unsigned)((uint64_t)seek >> 32), (unsigned)seek);
+    if (seek < 0) {
+        if (f != soup_probe_handle) soup_diag_event("write seek64=%08x:%08x\n", (unsigned)((uint64_t)seek >> 32), (unsigned)seek);
+        soup_diag_fail("write seek", (int32_t)seek); return -1;
+    }
     while (done < bytes) {
         uint32_t n = bytes - done;
         int wrote;
         if (n > SOUP_IO) n = SOUP_IO;
+        soup_diag_phase("write", 0);
         wrote = FIO_WriteFile(f, (const uint8_t *)src + done, n);
-        if (wrote <= 0 || (uint32_t)wrote != n) return -1;
+        if (f == soup_probe_handle) soup_diag_event("write=%d/%u\n", wrote, (unsigned)n);
+        if (wrote <= 0 || (uint32_t)wrote != n) { soup_diag_fail("write", wrote); return -1; }
         done += n;
     }
     return 0;
@@ -94,43 +219,87 @@ int soup_storage_check(void)
     FILE *f = 0, *second = 0;
     uint8_t *buffer = 0;
     uint32_t size = 0;
-    int created = 0, ok = 0;
-    if (ready) return ready > 0 ? 0 : -1;
+    int created = 0, ok = 0, rc, match;
+    if (ready) { soup_diag_phase("probe cached", ready); return ready > 0 ? 0 : -1; }
     ready = -1;
+    soup_diag_phase("probe existing", 0);
     f = FIO_OpenFile(probe, O_RDONLY | O_SYNC);
-    if (f || is_file(probe)) goto done;
+    soup_diag_event("existing=%08x\n", (unsigned)(uintptr_t)f);
+    if (f || is_file(probe)) { soup_diag_fail("probe existing", f != 0); goto done; }
+    soup_diag_phase("probe allocate", 0);
     buffer = fio_malloc(sizeof(token));
-    if (!buffer) goto done;
+    if (!buffer) { soup_diag_fail("probe allocate", -1); goto done; }
+    soup_diag_phase("probe create", 0);
     f = FIO_OpenFile(probe, SOUP_NEW_FILE_FLAGS);
-    if (!f) goto done;
+    soup_diag_event("create=%08x flags=%x\n", (unsigned)(uintptr_t)f, (unsigned)SOUP_NEW_FILE_FLAGS);
+    if (!f) { soup_diag_fail("probe create", 0); goto done; }
+    soup_probe_handle = f;
     created = 1;
-    if (FIO_GetFileSize(probe, &size) || size) goto done;
+    soup_diag_phase("probe size(open)", 0);
+    rc = FIO_GetFileSize(probe, &size);
+    soup_diag_event("stat0=%d size=%08x\n", rc, (unsigned)size);
+    if (rc || size) { soup_diag_fail("probe size(open)", rc); goto done; }
     memcpy(buffer, token, sizeof(token));
     if (soup_write_at(f, 0, buffer, sizeof(token))) goto done;
-    FIO_CloseFile(f); f = 0;
+    FIO_CloseFile(f); f = 0; soup_probe_handle = 0;
+    soup_diag_event("close1=done\n");
+    soup_diag_phase("probe reopen1", 0);
     f = FIO_OpenFile(probe, O_RDONLY | O_SYNC);
-    if (!f || FIO_GetFileSize(probe, &size) || size != sizeof(token) ||
-        soup_read_at(f, 0, buffer, sizeof(token)) || memcmp(buffer, token, sizeof(token))) goto done;
-    FIO_CloseFile(f); f = 0;
+    soup_diag_event("reopen1=%08x\n", (unsigned)(uintptr_t)f);
+    if (!f) { soup_diag_fail("probe reopen1", 0); goto done; }
+    soup_probe_handle = f;
+    soup_diag_phase("probe size1", 0);
+    rc = FIO_GetFileSize(probe, &size);
+    soup_diag_event("stat1=%d size=%08x\n", rc, (unsigned)size);
+    if (rc || size != sizeof(token)) { soup_diag_fail("probe size1", rc); goto done; }
+    if (soup_read_at(f, 0, buffer, sizeof(token))) goto done;
+    match = memcmp(buffer, token, sizeof(token));
+    soup_diag_event("match1=%d\n", match);
+    if (match) { soup_diag_fail("probe match1", match); goto done; }
+    FIO_CloseFile(f); f = 0; soup_probe_handle = 0;
+    soup_diag_event("close2=done\n");
+    soup_diag_phase("probe exclusive", 0);
     second = FIO_OpenFile(probe, SOUP_NEW_FILE_FLAGS);
-    if (second) goto done;
+    soup_diag_event("probe exclusive=%08x\n", (unsigned)(uintptr_t)second);
+    if (second) { soup_diag_fail("probe exclusive", 1); goto done; }
+    soup_diag_phase("probe reopen2", 0);
     f = FIO_OpenFile(probe, O_RDONLY | O_SYNC);
-    if (!f || FIO_GetFileSize(probe, &size) || size != sizeof(token) ||
-        soup_read_at(f, 0, buffer, sizeof(token)) || memcmp(buffer, token, sizeof(token))) goto done;
+    soup_diag_event("reopen2=%08x\n", (unsigned)(uintptr_t)f);
+    if (!f) { soup_diag_fail("probe reopen2", 0); goto done; }
+    soup_probe_handle = f;
+    soup_diag_phase("probe size2", 0);
+    rc = FIO_GetFileSize(probe, &size);
+    soup_diag_event("stat2=%d size=%08x\n", rc, (unsigned)size);
+    if (rc || size != sizeof(token)) { soup_diag_fail("probe size2", rc); goto done; }
+    if (soup_read_at(f, 0, buffer, sizeof(token))) goto done;
+    match = memcmp(buffer, token, sizeof(token));
+    soup_diag_event("match2=%d\n", match);
+    if (match) { soup_diag_fail("probe match2", match); goto done; }
     ok = 1;
 done:
-    if (second) FIO_CloseFile(second);
-    if (f) FIO_CloseFile(f);
+    if (second) { FIO_CloseFile(second); soup_diag_event("closeX=done\n"); }
+    if (f) { FIO_CloseFile(f); soup_diag_event("closeF=done\n"); }
+    soup_probe_handle = 0;
     fio_free(buffer);
-    if (created && FIO_RemoveFile(probe)) ok = 0;
+    if (created) {
+        soup_diag_phase("probe cleanup", 0);
+        rc = FIO_RemoveFile(probe);
+        soup_diag_event("cleanup=%d\n", rc);
+        if (rc) { soup_diag_fail("probe cleanup", rc); ok = 0; }
+    }
     if (ok) ready = 1;
+    if (ok) soup_diag_phase("probe passed", 0);
     return ok ? 0 : -1;
 }
 
 FILE *soup_create_new(const char *path)
 {
+    FILE *f;
     if (soup_storage_check()) return 0;
-    return FIO_OpenFile(path, SOUP_NEW_FILE_FLAGS);
+    soup_diag_phase("create open", 0);
+    f = FIO_OpenFile(path, SOUP_NEW_FILE_FLAGS);
+    if (!f) soup_diag_fail("create open", 0);
+    return f;
 }
 
 int soup_receipt_pending(void)
@@ -146,10 +315,12 @@ int soup_file_crc(const char *path, uint32_t *size, uint32_t *digest)
     uint8_t *buffer = 0;
     uint32_t length = 0, after = 0, offset = 0, crc = 0xffffffffu;
     int result = -1;
-    if (FIO_GetFileSize(path, &length) || !length || length > SOUP_MAX_FILE) return -1;
+    soup_diag_phase("digest size", 0);
+    if (FIO_GetFileSize(path, &length) || !length || length > SOUP_MAX_FILE) { soup_diag_fail("digest size", -1); return -1; }
+    soup_diag_phase("digest open", 0);
     f = FIO_OpenFile(path, O_RDONLY | O_SYNC);
     buffer = fio_malloc(SOUP_IO);
-    if (!f || !buffer) goto done;
+    if (!f || !buffer) { soup_diag_fail(f ? "digest allocate" : "digest open", 0); goto done; }
     while (offset < length) {
         uint32_t n = length - offset;
         if (n > SOUP_IO) n = SOUP_IO;
@@ -157,7 +328,8 @@ int soup_file_crc(const char *path, uint32_t *size, uint32_t *digest)
         crc = soup_crc(buffer, n, crc);
         offset += n;
     }
-    if (FIO_GetFileSize(path, &after) || after != length) goto done;
+    soup_diag_phase("digest verify", 0);
+    if (FIO_GetFileSize(path, &after) || after != length) { soup_diag_fail("digest verify", -1); goto done; }
     *size = length; *digest = crc ^ 0xffffffffu;
     result = 0;
 done:
@@ -172,8 +344,10 @@ int soup_equal_files(const char *left, const char *right)
     uint8_t *x = 0, *y = 0;
     uint32_t size = 0, other = 0, offset = 0;
     int result = -1;
+    soup_diag_phase("verify sizes", 0);
     if (FIO_GetFileSize(left, &size) || FIO_GetFileSize(right, &other) ||
         !size || size > SOUP_MAX_FILE || size != other) return -1;
+    soup_diag_phase("verify open", 0);
     a = FIO_OpenFile(left, O_RDONLY | O_SYNC); b = FIO_OpenFile(right, O_RDONLY | O_SYNC);
     x = fio_malloc(SOUP_IO); y = fio_malloc(SOUP_IO);
     if (!a || !b || !x || !y) goto done;
@@ -225,11 +399,15 @@ int soup_copy_new(const char *source, const char *target)
     FILE *in = 0, *out = 0;
     uint8_t *buffer = 0;
     uint32_t size = 0, offset = 0;
-    int created = 0, result = -1;
+    int created = 0, result = -1, rc;
+    soup_diag_phase("copy target", 0);
     if (is_file(target)) return soup_equal_files(source, target);
-    if (FIO_GetFileSize(source, &size) || !size || size > SOUP_MAX_FILE) return -1;
+    soup_diag_phase("copy size", 0);
+    rc = FIO_GetFileSize(source, &size);
+    if (rc || !size || size > SOUP_MAX_FILE) { soup_diag_fail("copy size", rc); return -1; }
+    soup_diag_phase("copy source open", 0);
     buffer = fio_malloc(SOUP_IO); in = FIO_OpenFile(source, O_RDONLY | O_SYNC);
-    if (!buffer || !in) goto done;
+    if (!buffer || !in) { soup_diag_fail(in ? "copy allocate" : "copy source open", 0); goto done; }
     out = soup_create_new(target);
     if (!out) goto done;
     created = 1;
@@ -240,7 +418,9 @@ int soup_copy_new(const char *source, const char *target)
         offset += n;
     }
     FIO_CloseFile(out); out = 0;
+    soup_diag_phase("copy verify", 0);
     if (!soup_equal_files(source, target)) result = 0;
+    else soup_diag_fail("copy verify", -1);
 done:
     if (out) FIO_CloseFile(out);
     if (in) FIO_CloseFile(in);
@@ -393,11 +573,17 @@ done:
 
 int soup_transaction_prepare(soup_transaction *tx)
 {
-    if (soup_receipt_pending()) return -1;
+    soup_diag_phase("backup pending", 0);
+    if (soup_receipt_pending()) { soup_diag_fail("backup pending", 1); return -1; }
     for (unsigned i = 0; i < 2; i++) if (tx->members & (1u << i)) {
         soup_member *m = &tx->files[i];
-        if (soup_copy_new(m->source, m->backup) || soup_equal_files(m->source, m->backup) ||
-            soup_file_crc(m->backup, &m->size, &m->backup_crc)) return -1;
+        soup_diag_paths(m->source, m->backup, m->stage);
+        soup_diag_phase("backup copy", 0);
+        if (soup_copy_new(m->source, m->backup)) { soup_diag_fail("backup copy", -1); return -1; }
+        soup_diag_phase("backup verify", 0);
+        if (soup_equal_files(m->source, m->backup)) { soup_diag_fail("backup verify", -1); return -1; }
+        soup_diag_phase("backup digest", 0);
+        if (soup_file_crc(m->backup, &m->size, &m->backup_crc)) { soup_diag_fail("backup digest", -1); return -1; }
         if (!i) { m->span_count = 1; m->spans[0].length = m->size; }
         else {
             soup_raw_layout layout;

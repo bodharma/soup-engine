@@ -45,4 +45,10 @@ int soup_transaction_commit(soup_transaction *);
 int soup_recover_pending(void);
 int soup_receipt_pending(void);
 int soup_component(const char *, int, int);
+void soup_diag_begin(int number);
+void soup_diag_paths(const char *source, const char *backup, const char *stage);
+void soup_diag_phase(const char *phase, int rc);
+void soup_diag_fail(const char *phase, int rc);
+const char *soup_status_text(void);
+void soup_diag_flush(void);
 #endif

@@ -97,6 +97,25 @@ look twice. After three permanent processing failures a frame is skipped with
 an on-screen error; a recovery problem disables processing instead. Restarting
 or disabling Film can leave queued originals unprocessed.
 
+## Diagnostic status
+
+`Shoot → Soup Film → Status` is read-only and retains the last processing
+phase and return code in RAM, including when Enable becomes OFF. To retain a
+report across power cycles, the test package supplies a pre-existing,
+exactly 512-byte `ML/SOUP/DIAG.TXT` beginning with
+`SOUP_DIAGNOSTIC_V1` followed by a newline. Soup never creates, truncates or
+resizes this file. A missing file, wrong header/length or logging error leaves
+the photo pipeline's result unchanged; RAM Status remains available.
+
+The bounded report records the source number and actual canonical source,
+backup and stage paths, plus recent processing events. The storage probe
+records its native create/open handles, size-call results, full 64-bit seek
+results as high:low hexadecimal words, read/write counts, token comparisons,
+second exclusive open and cleanup result. Reports are written only after
+the worker returns and closes photo/probe handles, using an ordinary existing
+read/write open without `O_SYNC`. This diagnostic build changes reporting;
+the photo creation flags, guards and publication behaviour are unchanged.
+
 ## Local build and tests
 
 With an Arm GNU `arm-none-eabi` toolchain available:

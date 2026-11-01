@@ -77,8 +77,11 @@ static int soup_write(void *ctx, const uint8_t *data, size_t bytes)
     if (bytes > io->limit - io->written) { io->capped = 1; return -1; }
     while (bytes) {
         uint32_t n = bytes > SOUP_IO ? SOUP_IO : (uint32_t)bytes;
+        int wrote;
         memcpy(io->dma, data, n);
-        if (FIO_WriteFile(io->file, io->dma, n) != (int)n) return -1;
+        soup_diag_phase("render write", 0);
+        wrote = FIO_WriteFile(io->file, io->dma, n);
+        if (wrote != (int)n) { soup_diag_fail("render write", wrote); return -1; }
         io->crc = crc32((void *)data, n, io->crc);
         io->written += n; data += n; bytes -= n;
     }
@@ -347,50 +350,75 @@ int soup_process_pair(const char *dir, const char *prefix, int number, se_stock 
     uint32_t a = 0, b = 0, aa = 0, bb = 0, limit = 0, thumb_limit = SOUP_THUMB;
     unsigned members;
     int complete = 1, created[2] = {0, 0}, result = -1;
+    soup_diag_begin(number);
+    soup_diag_phase("process pending", 0);
     if (soup_receipt_pending()) {
         int recovery = soup_recover_pending();
         if (recovery == SOUP_RECOVERY_BUSY) return 0;
-        if (recovery < 0) return -2;
+        if (recovery < 0) { soup_diag_fail("process recovery", recovery); return -2; }
     }
+    soup_diag_phase("process paths", 0);
     if (!dir || !prefix || !stock || soup_transaction_init(&tx, dir, prefix, number, 1) ||
         snprintf(jpg, sizeof(jpg), "%s/%s%04d.JPG", dir, prefix, number) >= (int)sizeof(jpg) ||
-        snprintf(cr2, sizeof(cr2), "%s/%s%04d.CR2", dir, prefix, number) >= (int)sizeof(cr2)) return -1;
+        snprintf(cr2, sizeof(cr2), "%s/%s%04d.CR2", dir, prefix, number) >= (int)sizeof(cr2)) { soup_diag_fail("process paths", -1); return -1; }
+    soup_diag_paths(tx.files[0].source, tx.files[0].backup, tx.files[0].stage);
+    soup_diag_phase("source idle", 0);
     if (!soup_idle()) return 0;
+    soup_diag_phase("source sizes", 0);
     if (FIO_GetFileSize(jpg, &a)) a = 0;
     if (FIO_GetFileSize(cr2, &b)) b = 0;
     members = (a ? SOUP_JPEG_MEMBER : 0) | (b ? SOUP_RAW_MEMBER : 0);
     if (!members) return 0;
     msleep(1000);
+    soup_diag_phase("source stable", 0);
     if (FIO_GetFileSize(jpg, &aa)) aa = 0;
     if (FIO_GetFileSize(cr2, &bb)) bb = 0;
     if (!soup_idle() || a != aa || b != bb) return 0;
-    if (soup_transaction_init(&tx, dir, prefix, number, members)) return -1;
+    if (soup_transaction_init(&tx, dir, prefix, number, members)) { soup_diag_fail("member paths", -1); return -1; }
+    {
+        soup_member *m = &tx.files[members & SOUP_JPEG_MEMBER ? 0 : 1];
+        soup_diag_paths(m->source, m->backup, m->stage);
+    }
+    soup_diag_phase("completion check", 0);
     for (unsigned i = 0; i < 2; i++) if (members & (1u << i))
         if (!is_file(tx.files[i].stage) || !is_file(tx.files[i].backup) ||
             soup_equal_files(tx.files[i].source, tx.files[i].stage)) complete = 0;
-    if (complete) return 1;
-    for (unsigned i = 0; i < 2; i++) if ((members & (1u << i)) && is_file(tx.files[i].stage)) return -1;
-    if (soup_make_dirs(&tx)) return -1;
+    if (complete) { soup_diag_phase("Already complete", 0); return 1; }
+    soup_diag_phase("stage guard", 0);
+    for (unsigned i = 0; i < 2; i++) if ((members & (1u << i)) && is_file(tx.files[i].stage)) { soup_diag_fail("stage guard", 1); return -1; }
+    soup_diag_phase("backup directories", 0);
+    if (soup_make_dirs(&tx)) { soup_diag_fail("backup directories", -1); return -1; }
+    soup_diag_phase("storage probe", 0);
     if (soup_storage_check()) return -3;
+    soup_diag_phase("backup prepare", 0);
     if (soup_transaction_prepare(&tx)) return -1;
     {
         const char *stage = members & SOUP_JPEG_MEMBER ? tx.files[0].stage : tx.files[1].stage;
         snprintf(render, sizeof(render), "%s", stage);
         memcpy(render + strlen(render) - 3, "NEW", 3);
     }
-    if (is_file(render)) return -1;
+    soup_diag_phase("render guard", 0);
+    if (is_file(render)) { soup_diag_fail("render guard", 1); return -1; }
     if (members & SOUP_JPEG_MEMBER) limit = tx.files[0].size;
     if (members & SOUP_RAW_MEMBER) {
-        if (soup_raw_inspect(tx.files[1].backup, &raw)) return -1;
+        soup_diag_phase("RAW inspect", 0);
+        if (soup_raw_inspect(tx.files[1].backup, &raw)) { soup_diag_fail("RAW inspect", -1); return -1; }
         if (!limit || raw.main_length < limit) limit = raw.main_length;
         thumb_limit = raw.thumb_length < SOUP_THUMB ? raw.thumb_length : SOUP_THUMB;
     }
+    {
+        soup_member *m = &tx.files[members & SOUP_JPEG_MEMBER ? 0 : 1];
+        soup_diag_paths(m->source, m->backup, m->stage);
+    }
+    soup_diag_phase("render", 0);
     if (soup_render(members & SOUP_JPEG_MEMBER ? tx.files[0].backup : tx.files[1].backup,
-                    render, !(members & SOUP_JPEG_MEMBER), stock, limit, thumb_limit, &rendered) < 0) return -1;
+                    render, !(members & SOUP_JPEG_MEMBER), stock, limit, thumb_limit, &rendered) < 0) { soup_diag_fail("render", -1); return -1; }
     if (members & SOUP_JPEG_MEMBER) {
-        if (soup_copy_new(tx.files[0].backup, tx.files[0].stage)) goto done;
+        soup_diag_paths(tx.files[0].source, tx.files[0].backup, tx.files[0].stage);
+        soup_diag_phase("JPEG stage", 0);
+        if (soup_copy_new(tx.files[0].backup, tx.files[0].stage)) { soup_diag_fail("JPEG stage copy", -1); goto done; }
         created[0] = 1;
-        if (soup_overlay_jpeg(render, tx.files[0].stage)) goto done;
+        if (soup_overlay_jpeg(render, tx.files[0].stage)) { soup_diag_fail("JPEG overlay", -1); goto done; }
         {
             uint32_t prefix_bytes = 0;
             if (FIO_GetFileSize(render, &prefix_bytes) || prefix_bytes > tx.files[0].size ||
@@ -399,15 +427,20 @@ int soup_process_pair(const char *dir, const char *prefix, int number, se_stock 
         }
     }
     if (members & SOUP_RAW_MEMBER) {
+        soup_diag_paths(tx.files[1].source, tx.files[1].backup, tx.files[1].stage);
+        soup_diag_phase("RAW stage", 0);
         if (soup_raw_stage(tx.files[1].backup, tx.files[1].stage, render, rendered.thumb,
-                           rendered.thumb_bytes, rendered.width, rendered.height, &raw)) goto done;
+                           rendered.thumb_bytes, rendered.width, rendered.height, &raw)) { soup_diag_fail("RAW stage", -1); goto done; }
         created[1] = 1;
     }
     for (unsigned i = 0; i < 2; i++) if (members & (1u << i)) {
         uint32_t stage_size = 0;
+        soup_diag_paths(tx.files[i].source, tx.files[i].backup, tx.files[i].stage);
+        soup_diag_phase("stage verify", 0);
         if (soup_file_crc(tx.files[i].stage, &stage_size, &tx.files[i].stage_crc) || stage_size != tx.files[i].size) goto done;
     }
     {
+        soup_diag_phase("publish", 0);
         int committed = soup_transaction_commit(&tx);
         if (committed) {
             result = committed == SOUP_COMMIT_BUSY ? 0 : (soup_receipt_pending() ? -2 : -1);
@@ -419,6 +452,8 @@ int soup_process_pair(const char *dir, const char *prefix, int number, se_stock 
     if (soup_idle() && is_pure_play_photo_mode()) { exit_play_qr_mode(); if (soup_idle()) enter_play_mode(); }
 #endif
 done:
+    if (result < 0) soup_diag_fail("process failed", result);
+    else soup_diag_phase(result ? "Complete" : "Waiting", 0);
     if (result != 1 && !soup_receipt_pending()) {
         for (int i = 0; i < 2; i++) if (created[i]) FIO_RemoveFile(tx.files[i].stage);
         FIO_RemoveFile(render);
@@ -517,6 +552,8 @@ void soup_worker(void *unused)
         NotifyBox(600000, "Soup: developing %s%04d", prefix, cursor + 1);
         rc = soup_process_pair(dir, prefix, cursor + 1, &stock);
         NotifyBoxHide();
+        /* All photo/probe handles are closed; logging cannot change the result. */
+        soup_diag_flush();
         if (rc == -3) {
             soup_disable_for_recovery();
             NotifyBox(10000, "Soup cannot safely create backups; photo unchanged");

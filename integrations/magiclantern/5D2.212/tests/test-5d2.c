@@ -38,6 +38,9 @@ static FILE *track(FILE *f, const char *path)
 int FIO_GetFileSize(const char *p, uint32_t *n)
 {
     struct stat st;
+    if (!strcmp(p, "ML/SOUP/DIAG.TXT"))
+        for (int i = 0; i < 32; i++)
+            assert(!handles[i].file || !strcmp(handles[i].path, "ML/SOUP/DIAG.TXT"));
     if ((hidden_path && !strcmp(p, hidden_path)) || stat(p, &st) || !S_ISREG(st.st_mode)) { *n = UINT32_MAX; return -1; }
     *n = (uint32_t)st.st_size + (unstable > 1 && !strncmp(p, "DCIM/", 5) ? 1 : 0);
     return 0;
@@ -48,6 +51,11 @@ int is_dir(const char *p) { struct stat s; return !stat(p, &s) && S_ISDIR(s.st_m
 FILE *FIO_OpenFile(const char *p, unsigned mode)
 {
     FILE *f;
+    if (!strcmp(p, "ML/SOUP/DIAG.TXT")) {
+        assert(mode == 0 || mode == 2u); /* Existing file only, without O_SYNC. */
+        for (int i = 0; i < 32; i++)
+            assert(!handles[i].file || !strcmp(handles[i].path, "ML/SOUP/DIAG.TXT"));
+    }
     /* 5D2.212 ROM _FIO_OpenFile bits, deliberately independent of the
      * ML header: create=0x100, truncate=0x200, exclusive=0x400. The old
      * ML 0x40/0x80 bits do not create a missing native file. */
@@ -63,6 +71,7 @@ FILE *FIO_OpenFile(const char *p, unsigned mode)
 }
 FILE *FIO_CreateFile(const char *p)
 {
+    assert(strcmp(p, "ML/SOUP/DIAG.TXT"));
     assert(strncmp(p, "DCIM/", 5)); /* Indexed files must never be truncated. */
     assert(!is_file(p));
     return track(fopen(p, "wb"), p);
@@ -79,6 +88,8 @@ int FIO_ReadFile(FILE *f, void *p, size_t n)
 }
 int FIO_WriteFile(FILE *f, const void *p, size_t n)
 {
+    if (!strcmp(name_of(f), "ML/SOUP/DIAG.TXT"))
+        assert(ftell(f) >= 0 && (uint64_t)ftell(f) + n <= 512);
     if (write_fault && strstr(name_of(f), write_fault) && write_budget >= 0) {
         if (!write_budget) return -1;
         if (n > (size_t)write_budget) {
@@ -96,7 +107,8 @@ void FIO_CloseFile(FILE *f)
     for (int i = 0; i < 32; i++) if (handles[i].file == f) { handles[i].file = NULL; assert(!fclose(f)); return; }
     assert(!"close of untracked file");
 }
-int FIO_SeekSkipFile(FILE *f, int off, int whence) { return fseek(f, off, whence); }
+int64_t FIO_SeekSkipFile(FILE *f, int64_t off, int whence)
+{ return fseek(f, (long)off, whence) ? -1 : (int64_t)ftell(f); }
 int FIO_RemoveFile(const char *p)
 { return receipt_remove_fails && !strcmp(p, SOUP_RECOVERY) ? -1 : remove(p); }
 int FIO_RenameFile(const char *a, const char *b) { return rename(a, b); }
@@ -147,6 +159,22 @@ static uint8_t *file_bytes(const char *path, size_t *size)
     assert(f && !fseek(f, 0, SEEK_END)); n = ftell(f); rewind(f); assert(n > 0);
     p = malloc((size_t)n); assert(p && fread(p, 1, (size_t)n, f) == (size_t)n && !fclose(f));
     *size = (size_t)n; return p;
+}
+static void seed_report(size_t bytes, int valid_cookie)
+{
+    uint8_t data[1024] = {0};
+    FILE *f = fopen("ML/SOUP/DIAG.TXT", "wb");
+    const char *cookie = valid_cookie ? "SOUP_DIAGNOSTIC_V1\n" : "UNOWNED\n";
+    assert(bytes <= sizeof(data)); memcpy(data, cookie, strlen(cookie));
+    assert(f && fwrite(data, 1, bytes, f) == bytes && !fclose(f));
+}
+static int report_has(const char *text)
+{
+    size_t n, len = strlen(text); uint8_t *data = file_bytes("ML/SOUP/DIAG.TXT", &n);
+    int found = 0;
+    for (size_t i = 0; len <= n && i <= n - len; i++)
+        if (!memcmp(data + i, text, len)) { found = 1; break; }
+    free(data); return found;
 }
 typedef struct { int rows, width, spread; uint64_t visible; } decoded;
 static int check_rows(void *ctx, const uint8_t *rgb, int rows, int width)
@@ -244,15 +272,60 @@ int main(int argc, char **argv)
     /* The capability probe must reject a backend that ignores O_EXCL.
      * A separate process keeps its one-time capability cache isolated. */
     {
-        pid_t child = fork(); int status;
-        assert(child >= 0);
-        if (!child) {
-            assert(!FIO_CreateDirectory("probe-ignored") && !chdir("probe-ignored"));
-            assert(!FIO_CreateDirectory("ML/SOUP")); ignore_exclusive = 1;
-            assert(!soup_create_new("ML/SOUP/should-not-exist.NEW"));
-            assert(!is_file("ML/SOUP/should-not-exist.NEW")); _exit(0);
+        static const struct { const char *dir; int bytes, cookie, write_fails; } cases[] = {
+            {"probe-ignored", 512, 1, 0}, {"diag-absent", 0, 1, 0},
+            {"diag-cookie", 512, 0, 0}, {"diag-short", 511, 1, 0},
+            {"diag-long", 513, 1, 0}, {"diag-write", 512, 1, 1},
+            {"diag-rollover", 512, 1, 0}
+        };
+        for (unsigned k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            pid_t child = fork(); int status;
+            assert(child >= 0);
+            if (!child) {
+                uint64_t before = 0;
+                char status_before[128];
+                assert(!FIO_CreateDirectory(cases[k].dir) && !chdir(cases[k].dir));
+                assert(!FIO_CreateDirectory("ML/SOUP")); ignore_exclusive = 1;
+                if (cases[k].bytes) {
+                    seed_report((size_t)cases[k].bytes, cases[k].cookie);
+                    before = file_hash("ML/SOUP/DIAG.TXT");
+                }
+                if (cases[k].write_fails) { write_fault = "ML/SOUP/DIAG.TXT"; write_budget = 0; }
+                assert(!soup_create_new("ML/SOUP/should-not-exist.NEW"));
+                if (k == 6) {
+                    char phase[100];
+                    soup_diag_begin(7);
+                    soup_diag_paths("A:/DCIM/100EOS5D/IMG_0001.CR2",
+                        "A:/ML/SOUP/ORIGINALS/100EOS5D/IMG_0001.CR2",
+                        "A:/ML/SOUP/STAGED/100EOS5D/IMG_0001.CR2");
+                    for (int i = 0; i < 100; i++) {
+                        snprintf(phase, sizeof(phase), "event %03d %080d", i, 0);
+                        soup_diag_phase(phase, 0);
+                    }
+                    soup_diag_fail("probe exclusive", -7);
+                }
+                soup_diag_phase("cleanup", 0);
+                assert(strstr(soup_status_text(), "probe exclusive"));
+                snprintf(status_before, sizeof(status_before), "%s", soup_status_text());
+                soup_diag_flush();
+                assert(!strcmp(status_before, soup_status_text()));
+                if (!k || k == 6) {
+                    uint32_t bytes;
+                    size_t report_bytes;
+                    uint8_t *report;
+                    assert(report_has("probe exclusive"));
+                    assert(!FIO_GetFileSize("ML/SOUP/DIAG.TXT", &bytes) && bytes == 512);
+                    report = file_bytes("ML/SOUP/DIAG.TXT", &report_bytes);
+                    assert(report_bytes == 512 && !memcmp(report, "SOUP_DIAGNOSTIC_V1\n", 19)); free(report);
+                    if (k == 6) assert(report_has("event 099") && !report_has("event 000"));
+                } else if (!cases[k].bytes) assert(!is_file("ML/SOUP/DIAG.TXT"));
+                else assert(file_hash("ML/SOUP/DIAG.TXT") == before);
+                assert(!is_file("ML/SOUP/should-not-exist.NEW"));
+                for (int i = 0; i < 32; i++) assert(!handles[i].file);
+                _exit(0);
+            }
+            assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         }
-        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     assert(!soup_frame_geometry(5616, 3744, &scale, &width, &height, &x, &y));
     assert(scale == 2 && width == 2784 && height == 1856 && x == 12 && y == 8);
@@ -278,6 +351,7 @@ int main(int argc, char **argv)
     assert(soup_process_pair(dir, "IMG_", 3, &stock) == 1);
     printf("HAPPY_OUTPUTS_READY: %s\n", argv[4]); fflush(stdout);
     if (getenv("SOUP_HAPPY_ONLY")) return 0;
+    assert(!is_file("ML/SOUP/DIAG.TXT")); /* Fault budgets measure processing alone. */
 
     /* Interrupted pair commit, then repeated interrupted rollback. */
     prepare_tx(&tx, 20, argv[2], argv[1]);
