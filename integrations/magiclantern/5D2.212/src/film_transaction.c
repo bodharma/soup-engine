@@ -309,6 +309,13 @@ int soup_receipt_pending(void)
     return is_file(SOUP_RECOVERY);
 }
 
+int soup_cleanup_pending(void)
+{
+    FILE *f = FIO_OpenFile(SOUP_CLEANUP, O_RDONLY | O_SYNC);
+    if (f) { FIO_CloseFile(f); return 1; }
+    return is_file(SOUP_CLEANUP);
+}
+
 int soup_file_crc(const char *path, uint32_t *size, uint32_t *digest)
 {
     FILE *f = 0;
@@ -476,8 +483,8 @@ int soup_transaction_init(soup_transaction *tx, const char *directory,
     if (!soup_component(folder, 8, 8) || folder[0] < '1' || folder[0] > '9' ||
         folder[1] < '0' || folder[1] > '9' || folder[2] < '0' || folder[2] > '9') return -1;
     memset(tx, 0, sizeof(*tx));
-    memcpy(tx->magic, "SOUPTX2", 8);
-    tx->version = 2; tx->number = number; tx->members = members;
+    memcpy(tx->magic, "SOUPTX3", 8);
+    tx->version = 3; tx->number = number; tx->members = members;
     snprintf(tx->directory, sizeof(tx->directory), "%s", directory);
     snprintf(tx->prefix, sizeof(tx->prefix), "%s", prefix);
     snprintf(root, sizeof(root), "%sML/SOUP", drive);
@@ -486,19 +493,30 @@ int soup_transaction_init(soup_transaction *tx, const char *directory,
         soup_member *m = &tx->files[i];
         if (!(members & (1u << i))) continue;
         snprintf(m->source, sizeof(m->source), "%s/%s%04d.%s", directory, prefix, number, extension);
-        snprintf(m->backup, sizeof(m->backup), "%s/ORIGINALS/%s/%s%04d.%s", root, folder, prefix, number, extension);
+        snprintf(m->backup, sizeof(m->backup), "%s/ORIG/%s/%s%04d.%s", root, folder, prefix, number, extension);
         snprintf(m->stage, sizeof(m->stage), "%s/STAGED/%s/%s%04d.%s", root, folder, prefix, number, extension);
     }
     return 0;
 }
 
-static int soup_valid_transaction(const soup_transaction *tx)
+int soup_render_path(const soup_transaction *tx, char path[SOUP_PATH])
+{
+    const char *stage = tx->files[tx->members & SOUP_JPEG_MEMBER ? 0 : 1].stage;
+    unsigned n = (unsigned)strlen(stage);
+    if (n < 3 || n >= SOUP_PATH) return -1;
+    memcpy(path, stage, n + 1);
+    memcpy(path + n - 3, "NEW", 3);
+    return 0;
+}
+
+/* Completion cleanup may run after its RAW backup has already been deleted. */
+static int soup_valid_paths(const soup_transaction *tx)
 {
     soup_transaction expected;
     int directory_end = 0, prefix_end = 0;
     for (unsigned i = 0; i < sizeof(tx->directory); i++) if (!tx->directory[i]) directory_end = 1;
     for (unsigned i = 0; i < sizeof(tx->prefix); i++) if (!tx->prefix[i]) prefix_end = 1;
-    if (memcmp(tx->magic, "SOUPTX2", 8) || tx->version != 2 ||
+    if (memcmp(tx->magic, "SOUPTX3", 8) || tx->version != 3 ||
         !directory_end || !prefix_end ||
         soup_transaction_init(&expected, tx->directory, tx->prefix, (int)tx->number, tx->members)) return -1;
     for (unsigned i = 0; i < 2; i++) {
@@ -511,10 +529,27 @@ static int soup_valid_transaction(const soup_transaction *tx)
         if (!i) {
             if (m->span_count != 1 || m->spans[0].offset || m->spans[0].length != m->size) return -1;
         } else {
-            soup_raw_layout layout;
-            if (soup_raw_inspect(m->backup, &layout) || m->span_count != layout.span_count ||
-                memcmp(m->spans, layout.spans, sizeof(soup_span) * layout.span_count)) return -1;
+            if (m->span_count != 6) return -1;
+            for (uint32_t j = 0; j < m->span_count; j++) {
+                if (!m->spans[j].length || m->spans[j].offset > m->size ||
+                    m->spans[j].length > m->size - m->spans[j].offset) return -1;
+                for (uint32_t k = 0; k < j; k++)
+                    if (m->spans[j].offset < m->spans[k].offset + m->spans[k].length &&
+                        m->spans[k].offset < m->spans[j].offset + m->spans[j].length) return -1;
+            }
         }
+    }
+    return 0;
+}
+
+static int soup_valid_transaction(const soup_transaction *tx)
+{
+    if (soup_valid_paths(tx)) return -1;
+    if (tx->members & SOUP_RAW_MEMBER) {
+        soup_raw_layout layout;
+        const soup_member *m = &tx->files[1];
+        if (soup_raw_inspect(m->backup, &layout) || m->span_count != layout.span_count ||
+            memcmp(m->spans, layout.spans, sizeof(soup_span) * layout.span_count)) return -1;
     }
     return 0;
 }
@@ -574,7 +609,7 @@ done:
 int soup_transaction_prepare(soup_transaction *tx)
 {
     soup_diag_phase("backup pending", 0);
-    if (soup_receipt_pending()) { soup_diag_fail("backup pending", 1); return -1; }
+    if (soup_cleanup_pending() || soup_receipt_pending()) { soup_diag_fail("backup pending", 1); return -1; }
     for (unsigned i = 0; i < 2; i++) if (tx->members & (1u << i)) {
         soup_member *m = &tx->files[i];
         soup_diag_paths(m->source, m->backup, m->stage);
@@ -595,18 +630,16 @@ int soup_transaction_prepare(soup_transaction *tx)
     return soup_valid_transaction(tx);
 }
 
-static int soup_read_receipt(soup_transaction *tx)
+static int soup_read_record(const char *path, void *destination, uint32_t bytes)
 {
     FILE *f = 0;
     void *buffer = 0;
     uint32_t size = 0;
     int result = -1;
-    if (FIO_GetFileSize(SOUP_RECOVERY, &size) || size != sizeof(*tx)) return -1;
-    buffer = fio_malloc(sizeof(*tx)); f = FIO_OpenFile(SOUP_RECOVERY, O_RDONLY | O_SYNC);
-    if (!buffer || !f || soup_read_at(f, 0, buffer, sizeof(*tx))) goto done;
-    memcpy(tx, buffer, sizeof(*tx));
-    if (soup_crc(tx, offsetof(soup_transaction, checksum), 0xffffffffu) != tx->checksum ||
-        soup_valid_transaction(tx)) goto done;
+    if (FIO_GetFileSize(path, &size) || size != bytes) return -1;
+    buffer = fio_malloc(bytes); f = FIO_OpenFile(path, O_RDONLY | O_SYNC);
+    if (!buffer || !f || soup_read_at(f, 0, buffer, bytes)) goto done;
+    memcpy(destination, buffer, bytes);
     result = 0;
 done:
     if (f) FIO_CloseFile(f);
@@ -614,9 +647,107 @@ done:
     return result;
 }
 
+static int soup_receipt_valid(const soup_transaction *tx)
+{
+    if (soup_crc(tx, offsetof(soup_transaction, checksum), 0xffffffffu) != tx->checksum ||
+        soup_valid_paths(tx) || tx->render_size < 4 || tx->render_size > SOUP_MAX_FILE) return -1;
+    if ((tx->members & SOUP_JPEG_MEMBER) && tx->render_size > tx->files[0].size) return -1;
+    if ((tx->members & SOUP_RAW_MEMBER) && tx->render_size > tx->files[1].spans[0].length) return -1;
+    return 0;
+}
+
+static int soup_read_receipt(soup_transaction *tx)
+{
+    return soup_read_record(SOUP_RECOVERY, tx, sizeof(*tx)) || soup_receipt_valid(tx) ||
+           soup_valid_transaction(tx) ? -1 : 0;
+}
+
+typedef struct {
+    char magic[8];
+    soup_transaction tx;
+    uint32_t checksum;
+} soup_completion;
+
+static int soup_read_completion(soup_completion *record)
+{
+    return soup_read_record(SOUP_CLEANUP, record, sizeof(*record)) ||
+           memcmp(record->magic, "SOUPCL1", 8) ||
+           soup_crc(record, offsetof(soup_completion, checksum), 0xffffffffu) != record->checksum ||
+           soup_receipt_valid(&record->tx) ? -1 : 0;
+}
+
+/* 0 absent, 1 byte-identified owned artifact, -1 present but not safely identified. */
+static int soup_owned_artifact(const char *path, uint32_t size, uint32_t crc)
+{
+    FILE *f = FIO_OpenFile(path, O_RDONLY | O_SYNC);
+    if (!f) return is_file(path) ? -1 : 0;
+    FIO_CloseFile(f);
+    return soup_digest_matches(path, size, crc) ? 1 : -1;
+}
+
+static int soup_cleanup_remove(const char *path)
+{
+    int rc;
+    soup_diag_phase("cleanup remove", 0);
+    rc = FIO_RemoveFile(path);
+    soup_diag_event("unlink=%d %s\n", rc, path);
+    if (rc) soup_diag_fail("cleanup remove", rc);
+    return rc;
+}
+
+static int soup_cleanup_locked(void)
+{
+    soup_completion record;
+    soup_transaction pending;
+    char render[SOUP_PATH];
+    int artifacts[5] = {0}, receipt;
+    if (!soup_cleanup_pending()) return 0;
+    soup_diag_phase("cleanup record", 0);
+    if (soup_read_completion(&record) || soup_render_path(&record.tx, render)) return -1;
+    /* A completion marker is one-way: never use RECOVER to restore these photos. */
+    for (unsigned i = 0; i < 2; i++) if (record.tx.members & (1u << i)) {
+        soup_member *m = &record.tx.files[i];
+        soup_diag_paths(m->source, m->backup, m->stage);
+        soup_diag_phase("cleanup source", 0);
+        if (!soup_digest_matches(m->source, m->size, m->stage_crc)) return -1;
+    }
+    receipt = soup_receipt_pending();
+    if (receipt && (soup_read_record(SOUP_RECOVERY, &pending, sizeof(pending)) ||
+                    soup_receipt_valid(&pending) || memcmp(&pending, &record.tx, sizeof(pending)))) return -1;
+    /* Validate every remaining artifact before deleting any of this group. */
+    for (unsigned i = 0; i < 2; i++) if (record.tx.members & (1u << i)) {
+        soup_member *m = &record.tx.files[i];
+        artifacts[i * 2] = soup_owned_artifact(m->backup, m->size, m->backup_crc);
+        artifacts[i * 2 + 1] = soup_owned_artifact(m->stage, m->size, m->stage_crc);
+        if (artifacts[i * 2] < 0 || artifacts[i * 2 + 1] < 0) return -1;
+    }
+    artifacts[4] = soup_owned_artifact(render, record.tx.render_size, record.tx.render_crc);
+    if (artifacts[4] < 0) return -1;
+    soup_diag_phase("cleanup delete", 0);
+    for (unsigned i = 0; i < 2; i++) if (record.tx.members & (1u << i)) {
+        soup_member *m = &record.tx.files[i];
+        if ((artifacts[i * 2] && soup_cleanup_remove(m->backup)) ||
+            (artifacts[i * 2 + 1] && soup_cleanup_remove(m->stage))) return SOUP_CLEANUP_PENDING;
+    }
+    if ((artifacts[4] && soup_cleanup_remove(render)) ||
+        (receipt && soup_cleanup_remove(SOUP_RECOVERY))) return SOUP_CLEANUP_PENDING;
+    return soup_cleanup_remove(SOUP_CLEANUP) ? SOUP_CLEANUP_PENDING : SOUP_CLEANUP_DONE;
+}
+
+int soup_cleanup_completed(void)
+{
+    int result;
+    if (!soup_cleanup_pending()) return 0;
+    if (soup_lock()) return SOUP_RECOVERY_BUSY;
+    result = soup_cleanup_locked();
+    soup_unlock();
+    return result;
+}
+
 static int soup_recover_locked(void)
 {
     soup_transaction tx;
+    if (soup_cleanup_pending()) return -1;
     if (!soup_receipt_pending()) return 0;
     if (soup_read_receipt(&tx)) return -1;
     /* Validate every member before restoring either member. */
@@ -637,6 +768,7 @@ static int soup_recover_locked(void)
 int soup_recover_pending(void)
 {
     int result;
+    if (soup_cleanup_pending()) return soup_cleanup_completed();
     if (!soup_receipt_pending()) return 0;
     if (soup_lock()) return SOUP_RECOVERY_BUSY;
     result = soup_recover_locked();
@@ -647,11 +779,15 @@ int soup_recover_pending(void)
 int soup_transaction_commit(soup_transaction *tx)
 {
     soup_transaction check;
+    soup_completion completion;
+    char render[SOUP_PATH];
     FILE *f = 0;
     void *buffer = 0;
     int result = -1, created = 0, armed = 0;
-    if (soup_receipt_pending() || soup_valid_transaction(tx)) return -1;
+    if (soup_cleanup_pending() || soup_receipt_pending() || soup_valid_transaction(tx) ||
+        tx->render_size < 4 || tx->render_size > SOUP_MAX_FILE || soup_render_path(tx, render)) return -1;
     if (soup_lock()) return SOUP_COMMIT_BUSY;
+    if (soup_cleanup_pending() || soup_receipt_pending()) goto done;
     for (unsigned i = 0; i < 2; i++) if (tx->members & (1u << i)) {
         soup_member *m = &tx->files[i];
         if (soup_equal_files(m->source, m->backup) ||
@@ -663,7 +799,9 @@ int soup_transaction_commit(soup_transaction *tx)
             if (soup_target_owned(&staged, 1)) goto done;
         }
     }
+    if (!soup_digest_matches(render, tx->render_size, tx->render_crc)) goto done;
     tx->checksum = soup_crc(tx, offsetof(soup_transaction, checksum), 0xffffffffu);
+    if (soup_receipt_valid(tx)) goto done;
     buffer = fio_malloc(sizeof(*tx));
     if (!buffer) goto done;
     memcpy(buffer, tx, sizeof(*tx));
@@ -678,7 +816,28 @@ int soup_transaction_commit(soup_transaction *tx)
         if (soup_patch_ranges(m->stage, m->source, m->spans, m->span_count) ||
             soup_equal_files(m->stage, m->source)) goto rollback;
     }
-    result = FIO_RemoveFile(SOUP_RECOVERY) ? -1 : 0;
+    memset(&completion, 0, sizeof(completion));
+    memcpy(completion.magic, "SOUPCL1", 8);
+    completion.tx = *tx;
+    completion.checksum = soup_crc(&completion, offsetof(soup_completion, checksum), 0xffffffffu);
+    fio_free(buffer); buffer = fio_malloc(sizeof(completion));
+    if (!buffer) goto rollback;
+    memcpy(buffer, &completion, sizeof(completion));
+    soup_diag_phase("completion create", 0);
+    f = soup_create_new(SOUP_CLEANUP);
+    if (!f) {
+        if (soup_cleanup_pending()) { result = SOUP_COMMIT_CLEANUP_PENDING; goto done; }
+        goto rollback;
+    }
+    /* Any completion file, including an interrupted write, forbids rollback. */
+    result = SOUP_COMMIT_CLEANUP_PENDING;
+    if (soup_write_at(f, 0, buffer, sizeof(completion))) goto done;
+    FIO_CloseFile(f); f = 0;
+    {
+        soup_completion verified;
+        if (soup_read_completion(&verified) || memcmp(&verified, &completion, sizeof(verified))) goto done;
+    }
+    if (soup_cleanup_locked() == SOUP_CLEANUP_DONE) result = 0;
     goto done;
 rollback:
     /* Keep the receipt if rollback cannot be fully verified. */

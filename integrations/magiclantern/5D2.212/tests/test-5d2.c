@@ -13,14 +13,35 @@ int soup_process_pair(const char *, const char *, int, se_stock *);
 int soup_finish_attempt(int, int *);
 int soup_frame_geometry(int, int, int *, int *, int *, int *, int *);
 
-typedef struct { FILE *file; char path[256]; } host_file;
+typedef struct { FILE *file; char path[256]; int backup_checked; } host_file;
 static host_file handles[32];
 static int busy, unstable, locked, locks, refuse_lock_once, short_read = 513;
 static const char *read_fault, *write_fault, *change_on_lock;
 static long read_budget = -1, write_budget = -1;
 static int zero_read, short_write, receipt_remove_fails, ignore_exclusive;
 static const char *hidden_path;
+static const char *remove_fault;
+static uint64_t original_raw_hash, original_jpeg_hash;
+static uint8_t completion_bytes[4096];
+static size_t completion_size;
+static int indexed_writes, removals;
+static uint64_t file_hash(const char *);
 FILE *soup_create_new(const char *);
+
+static int short_directory(const char *path)
+{
+    const char *p = path;
+    if (p[0] == 'A' && p[1] == ':' && p[2] == '/') p += 3;
+    if (strncmp(p, "ML/SOUP", 7)) return 1; /* Test workdirs are ordinary host paths. */
+    while (*p) {
+        const char *end = strchr(p, '/');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (!n || n > 8) return 0;
+        if (!end) break;
+        p = end + 1;
+    }
+    return 1;
+}
 
 static const char *name_of(FILE *f)
 {
@@ -31,7 +52,8 @@ static FILE *track(FILE *f, const char *path)
 {
     if (!f) return NULL;
     for (int i = 0; i < 32; i++) if (!handles[i].file) {
-        handles[i].file = f; snprintf(handles[i].path, sizeof(handles[i].path), "%s", path); return f;
+        handles[i].file = f; handles[i].backup_checked = 0;
+        snprintf(handles[i].path, sizeof(handles[i].path), "%s", path); return f;
     }
     assert(!"too many open files"); return NULL;
 }
@@ -47,7 +69,8 @@ int FIO_GetFileSize(const char *p, uint32_t *n)
 }
 int is_file(const char *p)
 { struct stat s; return !(hidden_path && !strcmp(p, hidden_path)) && !stat(p, &s) && S_ISREG(s.st_mode); }
-int is_dir(const char *p) { struct stat s; return !stat(p, &s) && S_ISDIR(s.st_mode); }
+int is_dir(const char *p)
+{ struct stat s; return short_directory(p) && !stat(p, &s) && S_ISDIR(s.st_mode); }
 FILE *FIO_OpenFile(const char *p, unsigned mode)
 {
     FILE *f;
@@ -88,6 +111,24 @@ int FIO_ReadFile(FILE *f, void *p, size_t n)
 }
 int FIO_WriteFile(FILE *f, const void *p, size_t n)
 {
+    const char *path = name_of(f);
+    if (!strncmp(path, "DCIM/", 5)) {
+        indexed_writes++;
+        for (int i = 0; i < 32; i++) if (handles[i].file == f && !handles[i].backup_checked) {
+            const char *base = strrchr(path, '/') + 1;
+            char source[128], backup[128];
+            for (int raw = 0; raw < 2; raw++) {
+                snprintf(source, sizeof(source), "DCIM/100EOS5D/%.8s.%s", base, raw ? "CR2" : "JPG");
+                snprintf(backup, sizeof(backup), "ML/SOUP/ORIG/100EOS5D/%.8s.%s", base, raw ? "CR2" : "JPG");
+                if (is_file(source)) assert(is_file(backup) && file_hash(backup) ==
+                    (raw ? original_raw_hash : original_jpeg_hash));
+            }
+            handles[i].backup_checked = 1;
+        }
+    }
+    if (!strcmp(path, SOUP_CLEANUP) && ftell(f) == 0) {
+        assert(n <= sizeof(completion_bytes)); memcpy(completion_bytes, p, n); completion_size = n;
+    }
     if (!strcmp(name_of(f), "ML/SOUP/DIAG.TXT"))
         assert(ftell(f) >= 0 && (uint64_t)ftell(f) + n <= 512);
     if (write_fault && strstr(name_of(f), write_fault) && write_budget >= 0) {
@@ -110,7 +151,12 @@ void FIO_CloseFile(FILE *f)
 int64_t FIO_SeekSkipFile(FILE *f, int64_t off, int whence)
 { return fseek(f, (long)off, whence) ? -1 : (int64_t)ftell(f); }
 int FIO_RemoveFile(const char *p)
-{ return receipt_remove_fails && !strcmp(p, SOUP_RECOVERY) ? -1 : remove(p); }
+{
+    removals++;
+    if ((remove_fault && !strcmp(p, remove_fault)) ||
+        (receipt_remove_fails && !strcmp(p, SOUP_RECOVERY))) return -1;
+    return remove(p);
+}
 int FIO_RenameFile(const char *a, const char *b) { return rename(a, b); }
 void *fio_malloc(size_t n) { return malloc(n); }
 void fio_free(void *p) { free(p); }
@@ -134,6 +180,7 @@ void soup_host_unlock(void) { assert(locked); locked = 0; }
 int FIO_CreateDirectory(const char *p)
 {
     char path[256]; size_t i;
+    if (!short_directory(p)) return -1;
     assert(strlen(p) < sizeof(path)); strcpy(path, p);
     for (i = 1; path[i]; i++) if (path[i] == '/') {
         path[i] = 0; if (mkdir(path, 0700) && errno != EEXIST) return -1; path[i] = '/';
@@ -242,6 +289,30 @@ static void check_raw(const char *path, const char *original)
     }
     assert(!memcmp(old + before.raw_offset, now + before.raw_offset, before.raw_length)); free(old); free(now);
 }
+static void make_render(const char *path)
+{
+    size_t n, at = 2, end = 0; uint8_t *p = file_bytes("DCIM/100EOS5D/IMG_0003.JPG", &n);
+    while (at + 4 <= n) {
+        unsigned marker, length;
+        assert(p[at++] == 0xff); marker = p[at++];
+        length = (unsigned)p[at] << 8 | p[at + 1]; assert(length >= 2 && length <= n - at);
+        at += length;
+        if (marker == 0xda) {
+            for (; at + 1 < n; at++) if (p[at] == 0xff && p[at + 1] == 0xd9) { end = at + 2; break; }
+            break;
+        }
+    }
+    assert(end);
+    { FILE *f = fopen(path, "wb"); assert(f && fwrite(p, 1, end, f) == end && !fclose(f)); }
+    free(p);
+}
+static void assert_clean(const soup_transaction *tx)
+{
+    char render[SOUP_PATH]; assert(!soup_render_path(tx, render));
+    assert(!is_file(render) && !is_file(SOUP_RECOVERY) && !is_file(SOUP_CLEANUP));
+    for (unsigned i = 0; i < 2; i++) if (tx->members & (1u << i))
+        assert(!is_file(tx->files[i].backup) && !is_file(tx->files[i].stage));
+}
 static void prepare_tx(soup_transaction *tx, int number, const char *jpeg, const char *raw)
 {
     assert(!soup_transaction_init(tx, "DCIM/100EOS5D", "IMG_", number, raw ? 3 : 1));
@@ -253,11 +324,97 @@ static void prepare_tx(soup_transaction *tx, int number, const char *jpeg, const
         copy_file(i ? "DCIM/100EOS5D/IMG_0003.CR2" : "DCIM/100EOS5D/IMG_0003.JPG", tx->files[i].stage);
         assert(!soup_file_crc(tx->files[i].stage, &size, &tx->files[i].stage_crc) && size == tx->files[i].size);
     }
+    { char render[SOUP_PATH]; assert(!soup_render_path(tx, render)); make_render(render);
+        assert(!soup_file_crc(render, &tx->render_size, &tx->render_crc)); }
 }
 static void clear_faults(void)
 {
-    read_fault = write_fault = change_on_lock = hidden_path = NULL;
+    read_fault = write_fault = change_on_lock = hidden_path = remove_fault = NULL;
     read_budget = write_budget = -1; zero_read = short_write = receipt_remove_fails = 0;
+}
+static void assert_applied(const soup_transaction *tx)
+{
+    assert(file_hash(tx->files[0].source) == file_hash("DCIM/100EOS5D/IMG_0003.JPG"));
+    if (tx->members & SOUP_RAW_MEMBER)
+        assert(file_hash(tx->files[1].source) == file_hash("DCIM/100EOS5D/IMG_0003.CR2"));
+}
+static void resume_cleanup(void)
+{
+    pid_t child = fork(); int status;
+    assert(child >= 0);
+    if (!child) {
+        int writes = indexed_writes;
+        assert(soup_recover_pending() == SOUP_CLEANUP_DONE && indexed_writes == writes);
+        assert(soup_recover_pending() == 0); _exit(0);
+    }
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+static void test_cleanup(const char *jpeg, const char *raw, se_stock *stock)
+{
+    soup_transaction tx;
+    char render[SOUP_PATH], failed[SOUP_PATH];
+    /* Each deletion can fail after earlier artifacts have already vanished.
+     * A fresh process must finish cleanup without touching indexed photos. */
+    for (int k = 0; k < 7; k++) {
+        const char *paths[7];
+        prepare_tx(&tx, 60, jpeg, raw); assert(!soup_render_path(&tx, render));
+        paths[0] = tx.files[0].backup; paths[1] = tx.files[0].stage;
+        paths[2] = tx.files[1].backup; paths[3] = tx.files[1].stage;
+        paths[4] = render; paths[5] = SOUP_RECOVERY; paths[6] = SOUP_CLEANUP;
+        snprintf(failed, sizeof(failed), "%s", paths[k]); remove_fault = failed;
+        assert(soup_transaction_commit(&tx) == SOUP_COMMIT_CLEANUP_PENDING);
+        assert(is_file(SOUP_CLEANUP) && is_file(failed)); assert_applied(&tx);
+        clear_faults(); busy = 1;
+        assert(soup_recover_pending() == SOUP_RECOVERY_BUSY && is_file(SOUP_CLEANUP)); busy = 0;
+        resume_cleanup(); assert_applied(&tx); assert_clean(&tx);
+    }
+    /* Partial completion records block rollback and preserve all artifacts.
+     * Replaying the captured full record only repairs this test fixture. */
+    for (int k = 0; k < 3; k++) {
+        int deleted, writes;
+        prepare_tx(&tx, 61, jpeg, raw); deleted = removals;
+        if (k < 2) { write_fault = "CLEANUP.BIN"; write_budget = 10; short_write = k; }
+        else { read_fault = "CLEANUP.BIN"; read_budget = 0; }
+        assert(soup_transaction_commit(&tx) == SOUP_COMMIT_CLEANUP_PENDING && is_file(SOUP_CLEANUP));
+        assert(removals == deleted); assert_applied(&tx); writes = indexed_writes;
+        for (unsigned i = 0; i < 2; i++) assert(is_file(tx.files[i].backup) && is_file(tx.files[i].stage));
+        clear_faults();
+        if (k < 2) {
+            FILE *f;
+            assert(soup_recover_pending() == -1 && indexed_writes == writes && removals == deleted);
+            assert_applied(&tx); assert(is_file(SOUP_RECOVERY));
+            f = fopen(SOUP_CLEANUP, "wb");
+            assert(completion_size && f && fwrite(completion_bytes, 1, completion_size, f) == completion_size && !fclose(f));
+        }
+        resume_cleanup(); assert_applied(&tx); assert_clean(&tx);
+    }
+    /* Changed source, artifact or RECOVER record must be preserved, even
+     * though CLEANUP exists and records a previously verified publication. */
+    prepare_tx(&tx, 62, jpeg, raw); assert(!soup_render_path(&tx, render));
+    read_fault = "CLEANUP.BIN"; read_budget = 0;
+    assert(soup_transaction_commit(&tx) == SOUP_COMMIT_CLEANUP_PENDING); clear_faults();
+    {
+        const char *paths[] = {tx.files[0].backup, tx.files[1].stage, render, SOUP_RECOVERY, tx.files[0].source};
+        for (unsigned k = 0; k < sizeof(paths) / sizeof(paths[0]); k++) {
+            uint64_t changed; int writes = indexed_writes, deleted = removals;
+            flip_byte(paths[k], 9); changed = file_hash(paths[k]);
+            assert(soup_recover_pending() == -1 && is_file(SOUP_CLEANUP));
+            assert(file_hash(paths[k]) == changed && indexed_writes == writes && removals == deleted);
+            flip_byte(paths[k], 9);
+        }
+    }
+    resume_cleanup(); assert_applied(&tx); assert_clean(&tx);
+    /* Process-level applied/pending is successful publication, not a retry. */
+    assert(!soup_transaction_init(&tx, "DCIM/100EOS5D", "IMG_", 70, 1)); copy_file(jpeg, tx.files[0].source);
+    remove_fault = tx.files[0].backup;
+    assert(soup_process_pair("DCIM/100EOS5D", "IMG_", 70, stock) == 2);
+    assert(is_file(SOUP_CLEANUP)); check_jpeg(tx.files[0].source);
+    { int failures = 0, writes = indexed_writes;
+        assert(soup_finish_attempt(2, &failures) == 1 && !failures);
+        clear_faults(); resume_cleanup(); assert(indexed_writes == writes);
+    }
+    assert_clean(&tx);
+    puts("Temporary backups: publication guards, seven deletion cuts, reboot cleanup, partial records and ownership conflicts passed.");
 }
 
 int main(int argc, char **argv)
@@ -266,7 +423,7 @@ int main(int argc, char **argv)
     uint64_t raw_hash, jpeg_hash; soup_transaction tx; char path[256];
     int scale, width, height, x, y, failures = 0;
     if (argc != 5) return 2;
-    raw_hash = file_hash(argv[1]); jpeg_hash = file_hash(argv[2]);
+    raw_hash = original_raw_hash = file_hash(argv[1]); jpeg_hash = original_jpeg_hash = file_hash(argv[2]);
     text = file_bytes(argv[3], &n); se_stock_init(&stock); assert(se_stock_parse(text, n, &stock) == SE_OK); free(text);
     assert(!chdir(argv[4])); assert(!FIO_CreateDirectory(dir)); assert(!FIO_CreateDirectory("ML"));
     /* The capability probe must reject a backend that ignores O_EXCL.
@@ -296,7 +453,7 @@ int main(int argc, char **argv)
                     char phase[100];
                     soup_diag_begin(7);
                     soup_diag_paths("A:/DCIM/100EOS5D/IMG_0001.CR2",
-                        "A:/ML/SOUP/ORIGINALS/100EOS5D/IMG_0001.CR2",
+                        "A:/ML/SOUP/ORIG/100EOS5D/IMG_0001.CR2",
                         "A:/ML/SOUP/STAGED/100EOS5D/IMG_0001.CR2");
                     for (int i = 0; i < 100; i++) {
                         snprintf(phase, sizeof(phase), "event %03d %080d", i, 0);
@@ -339,16 +496,12 @@ int main(int argc, char **argv)
     for (int i = 1; i <= 3; i++) {
         fprintf(stderr, "Rendering Acros frame %d/3\n", i);
         assert(soup_process_pair(dir, "IMG_", i, &stock) == 1 && !is_file(SOUP_RECOVERY));
+        assert(!soup_transaction_init(&tx, dir, "IMG_", i, i == 1 ? 2 : i == 2 ? 1 : 3)); assert_clean(&tx);
         snprintf(path, sizeof(path), "DCIM/100EOS5D/IMG_%04d.%s", i, i == 1 ? "CR2" : "JPG");
         if (i == 1) check_raw(path, argv[1]); else check_jpeg(path);
     }
     check_raw("DCIM/100EOS5D/IMG_0003.CR2", argv[1]);
-    assert(file_hash("ML/SOUP/ORIGINALS/100EOS5D/IMG_0001.CR2") == raw_hash);
-    assert(file_hash("ML/SOUP/ORIGINALS/100EOS5D/IMG_0002.JPG") == jpeg_hash);
-    assert(file_hash("ML/SOUP/ORIGINALS/100EOS5D/IMG_0003.CR2") == raw_hash);
-    assert(file_hash("ML/SOUP/ORIGINALS/100EOS5D/IMG_0003.JPG") == jpeg_hash);
     assert(file_hash("DCIM/100EOS5D/IMG_0003.CR2") != raw_hash && file_hash("DCIM/100EOS5D/IMG_0003.JPG") != jpeg_hash);
-    assert(soup_process_pair(dir, "IMG_", 3, &stock) == 1);
     printf("HAPPY_OUTPUTS_READY: %s\n", argv[4]); fflush(stdout);
     if (getenv("SOUP_HAPPY_ONLY")) return 0;
     assert(!is_file("ML/SOUP/DIAG.TXT")); /* Fault budgets measure processing alone. */
@@ -396,14 +549,14 @@ int main(int argc, char **argv)
             assert(file_hash(tx.files[0].backup) == jpeg_hash && file_hash(tx.files[1].backup) == raw_hash);
         }
     }
-    /* A fully committed pair remains recoverable when receipt removal fails. */
+    /* Cleanup failures keep applied images and resume cleanup, never rollback. */
     receipt_remove_fails = 1;
-    assert(soup_transaction_commit(&tx) == -1 && is_file(SOUP_RECOVERY));
-    assert(!soup_equal_files(tx.files[0].source, tx.files[0].stage) &&
-           !soup_equal_files(tx.files[1].source, tx.files[1].stage));
-    clear_faults(); assert(soup_recover_pending() == 1);
-    assert(file_hash(tx.files[0].source) == jpeg_hash && file_hash(tx.files[1].source) == raw_hash);
+    assert(soup_transaction_commit(&tx) == SOUP_COMMIT_CLEANUP_PENDING && is_file(SOUP_CLEANUP));
+    assert(file_hash(tx.files[0].source) == file_hash("DCIM/100EOS5D/IMG_0003.JPG") &&
+           file_hash(tx.files[1].source) == file_hash("DCIM/100EOS5D/IMG_0003.CR2"));
+    clear_faults(); assert(soup_recover_pending() == SOUP_CLEANUP_DONE); assert_clean(&tx);
     /* A recomputed stage CRC cannot authorize a changed sensor byte. */
+    prepare_tx(&tx, 25, argv[2], argv[1]);
     {
         soup_raw_layout layout; uint32_t size;
         assert(!soup_raw_inspect(tx.files[1].backup, &layout));
@@ -448,7 +601,7 @@ int main(int argc, char **argv)
     for (int k = 0; k < 4; k++) {
         snprintf(path, sizeof(path), "%s/IMG_%04d.JPG", dir, 30 + k); copy_file(argv[2], path);
         if (k < 2) { read_fault = "DCIM/"; read_budget = 600000; zero_read = k; }
-        else { write_fault = "ORIGINALS/"; write_budget = 100; short_write = k == 3; }
+        else { write_fault = "ORIG/"; write_budget = 100; short_write = k == 3; }
         assert(soup_process_pair(dir, "IMG_", 30 + k, &stock) == -1); clear_faults();
         assert(file_hash(path) == jpeg_hash && !is_file(SOUP_RECOVERY));
     }
@@ -491,6 +644,8 @@ int main(int argc, char **argv)
     assert(!is_file("ML/SOUP/STAGED/100EOS5D/IMG_0043.NEW"));
     assert(!soup_finish_attempt(0, &failures) && !failures);
     assert(soup_process_pair(dir, "IMG_", 43, &stock) == 1); check_jpeg(tx.files[0].source);
+    assert_clean(&tx);
+    test_cleanup(argv[2], argv[1], &stock);
     assert(soup_finish_attempt(1, &failures) == 1 && !failures);
     assert(file_hash(argv[1]) == raw_hash && file_hash(argv[2]) == jpeg_hash && !locked && locks > 3);
     for (int i = 0; i < 32; i++) assert(!handles[i].file);

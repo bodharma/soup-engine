@@ -12,10 +12,14 @@
 #define SOUP_IO 8192u
 #define SOUP_MAX_FILE (128u * 1024 * 1024)
 #define SOUP_RECOVERY "ML/SOUP/RECOVER.BIN"
+#define SOUP_CLEANUP "ML/SOUP/CLEANUP.BIN"
 #define SOUP_JPEG_MEMBER 1u
 #define SOUP_RAW_MEMBER 2u
 #define SOUP_RECOVERY_BUSY -2
 #define SOUP_COMMIT_BUSY -2
+#define SOUP_COMMIT_CLEANUP_PENDING 1
+#define SOUP_CLEANUP_DONE 2
+#define SOUP_CLEANUP_PENDING 3
 
 typedef struct {
     char source[SOUP_PATH], backup[SOUP_PATH], stage[SOUP_PATH];
@@ -27,6 +31,7 @@ typedef struct {
     char magic[8], directory[SOUP_PATH], prefix[5];
     uint32_t version, number, members;
     soup_member files[2];
+    uint32_t render_size, render_crc;
     uint32_t checksum;
 } soup_transaction;
 
@@ -40,10 +45,13 @@ int soup_storage_check(void);
 FILE *soup_create_new(const char *);
 int soup_patch_ranges(const char *, const char *, const soup_span *, uint32_t);
 int soup_transaction_init(soup_transaction *, const char *, const char *, int, unsigned);
+int soup_render_path(const soup_transaction *, char path[SOUP_PATH]);
 int soup_transaction_prepare(soup_transaction *);
 int soup_transaction_commit(soup_transaction *);
 int soup_recover_pending(void);
 int soup_receipt_pending(void);
+int soup_cleanup_pending(void);
+int soup_cleanup_completed(void);
 int soup_component(const char *, int, int);
 void soup_diag_begin(int number);
 void soup_diag_paths(const char *source, const char *backup, const char *stage);

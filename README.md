@@ -3,10 +3,11 @@
 # 🎞️ Soup Engine <sub><sup>beta</sup></sub>
 
 > **Experimental EOS 5D Mark II port (Canon firmware 2.1.2):**
-> backs up originals, then updates the existing JPEG or RAW playback previews
-> with the selected look. See [the port notes](docs/5D2-port.md) for supported
-> RAW/JPEG modes, recovery and local builds. This playback update and its
-> processing speed have not been validated on a camera.
+> keeps verified temporary originals until the existing JPEG or RAW playback
+> previews are updated successfully, then removes its temporary photo files.
+> See [the port notes](docs/5D2-port.md) for supported RAW/JPEG modes, recovery,
+> cleanup and local builds. A manually prepared styled image displays in Canon
+> PLAY; this automatic processing and cleanup path still needs camera testing.
 
 ### Film looks, in the camera, on a Canon EOS 5D Classic or EOS 50D.
 

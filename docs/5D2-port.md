@@ -2,8 +2,9 @@
 
 Target: Canon firmware **2.1.2**, with Magic Lantern source pinned in
 `integrations/magiclantern/5D2.212/SOUP-PIN.txt`. This version updates existing
-camera playback images after processing. Its new playback and recovery paths
-have not been validated on a physical camera.
+camera playback images after processing. A manually prepared styled frame has
+displayed correctly in Canon PLAY. The automatic processing, recovery and
+temporary-file cleanup paths still need camera testing.
 
 ## Shooting and playback
 
@@ -15,10 +16,11 @@ have not been validated on a physical camera.
 2. Full RAW uses its embedded JPEG; JPEG-only uses the camera JPEG. RAW+JPEG
    prefers the JPEG and applies one look to both the indexed JPEG and the
    CR2's main JPEG preview and thumbnail.
-3. Byte-exact originals are retained at
-   `A:/ML/SOUP/ORIGINALS/<DCIM-folder>/<original-basename>`. Existing backups
-   are never overwritten. Updated files keep their original DCIM paths, so
-   no new filename or image-library registration is required.
+3. Byte-exact originals are kept temporarily at
+   `A:/ML/SOUP/ORIG/<DCIM-folder>/<original-basename>`. Existing backups
+   are never overwritten. Once both indexed files verify successfully,
+   Soup removes its original copies, stages and rendered candidate. Updated
+   files keep their original DCIM paths; no new image registration is needed.
 4. Canon Large images decode at half size and are centre-cropped from
    2808×1872 to the native Small size, 2784×1856. Medium 4080×2720 and Small
    2784×1856 JPEGs retain their native dimensions. Real styled 160×120 JPEG
@@ -37,7 +39,9 @@ Soup first waits for Canon's capture job to become idle and for both possible
 source sizes to remain unchanged for one second. Before creating backups it
 checks exclusive-create semantics on a disposable private probe file. If the
 camera does not honour exclusive creation, processing stops and reports that
-backups cannot be safely created. The probe never touches a photo.
+backups cannot be safely created. The probe never touches a photo. New backup
+directory `ORIG` and work directory `STAGED` use short names supported by the
+5D2's native path lookup; old `ORIGINALS` directories are left untouched.
 New files use the 5D2.212 firmware's native create/exclusive flags (`0x100`
 and `0x400`), verified from its file-opening code; ML's generic POSIX flag
 values do not match this camera.
@@ -61,7 +65,9 @@ EOI remain from the original file and are ignored by tested computer JPEG
 decoders. **Canon's acceptance of this trailing-data shortcut is unverified.**
 Orientation and available date information are carried into generated EXIF;
 JPEG-only exposure/GPS and proprietary metadata are not all copied. The
-byte-exact backup retains all original metadata.
+temporary byte-exact backup retains all original metadata until the update
+verifies. **After successful cleanup, the original JPEG and its discarded
+metadata are no longer saved on the card.**
 
 A staged CR2 keeps its original size and offsets. Only its existing main JPEG
 preview, 160×120 thumbnail, and their dimension/count fields may be patched.
@@ -75,7 +81,8 @@ Before the first indexed write, Soup closes and reads back a checksummed
 `ML/SOUP/RECOVER.BIN` receipt containing the pair membership, canonical paths,
 lengths, CRC32 values and allowed patch spans. Indexed files are opened for
 bounded updates; the destructive `FIO_CreateFile` and unsafe rename fallback
-are never used on them. Backups are never deleted.
+are never used on them. Originals remain available throughout a pending write
+or rollback.
 
 If an update fails, both members are rolled back from their verified backups.
 A pending receipt is checked at the next startup **even with Enable OFF and
@@ -83,7 +90,25 @@ without film-stock files**. Recovery waits for an idle camera, validates the
 receipt, backups and target identity, restores the pair, and verifies full
 byte equality before removing the receipt. Interrupted rollback can be retried.
 An invalid receipt, mismatching backup or uncertain target is preserved for
-review; indexed processing is disabled with a recovery notification.
+review; indexed processing is disabled with a recovery notification. Legacy
+receipts referring to the former `ORIGINALS` layout are preserved and block
+new processing rather than being migrated automatically.
+
+After both indexed photos match their complete candidates, Soup writes and
+reads back a separate, checksummed `ML/SOUP/CLEANUP.BIN` completion record.
+Only then may it delete its matching original copies, stages, rendered `.NEW`
+candidate and pending `RECOVER.BIN`. `CLEANUP.BIN` is deleted last. The record
+identifies the committed sources and each temporary file by canonical path,
+length and CRC32. Every present artifact must match before cleanup proceeds;
+conflicting files are preserved.
+
+Any completion record takes precedence over rollback at startup, including
+with Enable OFF. Cleanup rechecks both committed source identities under the
+Canon UI lock and can continue when some temporary files are already gone.
+A corrupt or partial completion record blocks processing and never causes
+the committed image to be restored from an old backup. A cleanup failure is
+reported as **applied, cleanup pending**; Soup advances that shot and disables
+new work until startup cleanup succeeds. It does not apply the look again.
 
 **Close/reopen and byte comparison establish logical verification, not proven
 write durability.** Canon's `O_SYNC` behaviour and CF ordering are unverified;
@@ -91,9 +116,9 @@ there is no proven flush/barrier API here. Power loss, removal or a damaged
 card can still corrupt files or backups. Recovery is best effort, and backups
 on the same card do not replace an off-card copy.
 
-Existing photos are not backfilled when Enable is switched on. Staged copies
-are retained as completion evidence, so repeat processing does not apply the
-look twice. After three permanent processing failures a frame is skipped with
+Existing photos are not backfilled when Enable is switched on. The worker's
+capture cursor tracks completed shots; temporary photo copies are removed
+after successful publication and cleanup. After three permanent processing failures a frame is skipped with
 an on-screen error; a recovery problem disables processing instead. Restarting
 or disabling Film can leave queued originals unprocessed.
 
@@ -139,7 +164,7 @@ sh integrations/magiclantern/5D2.212/tests/run-host-tests.sh /absolute/sample.CR
 Host checks exercise RAW/JPEG/pair processing, full JPEG and styled-thumbnail
 decoding, byte-exact backups, RAW non-patch byte preservation, exclusive-create
 failures, bounded I/O, staged corruption, interrupted publication and repeated
-rollback, and receipt validation. Native worker directory/prefix/cursor
+rollback, completion-marker validation and interrupted cleanup. Native worker directory/prefix/cursor
 transitions and physical Canon UI exclusion have not been executed by these
 tests. Film names describe approximations, not measured Fujifilm-equivalent
 colour.

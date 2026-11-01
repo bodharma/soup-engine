@@ -1,4 +1,4 @@
-/* Native PLAY updates start disabled; immutable originals are backed up first. */
+/* Native PLAY updates start disabled; temporary verified backups protect publication. */
 #include "dryos.h"
 #include "config.h"
 #include "fio-ml.h"
@@ -77,14 +77,14 @@ static struct menu_entry soup_menu[] = {
     {
         .name = "Soup Film",
         .select = menu_open_submenu,
-        .help = "Update PLAY after processing. Originals backed up in ML/SOUP.",
+        .help = "Update PLAY. Temporary originals are removed after verified success.",
         .children = (struct menu_entry[]) {
             {
                 .name = "Enable",
                 .priv = &soup_on,
                 .max = 1,
                 .choices = CHOICES("OFF", "ON"),
-                .help = "Back up originals, then update JPEG/RAW playback previews.",
+                .help = "Keep originals until the JPEG/RAW update verifies, then clean up.",
             },
             {
                 .name = "Stock",
@@ -121,8 +121,10 @@ static void soup_init(void *unused)
             }
             if (recovery == SOUP_RECOVERY_BUSY) msleep(250);
         } while (recovery == SOUP_RECOVERY_BUSY);
-        soup_recovery_ready = recovery >= 0;
+        soup_recovery_ready = recovery >= 0 && recovery != SOUP_CLEANUP_PENDING;
         if (recovery < 0) NotifyBox(10000, "Soup recovery needs attention; processing disabled");
+        else if (recovery == SOUP_CLEANUP_PENDING) NotifyBox(10000, "Soup applied; cleanup pending. Processing disabled");
+        else if (recovery == SOUP_CLEANUP_DONE) NotifyBox(8000, "Soup completed temporary-file cleanup");
         else if (recovery > 0) NotifyBox(8000, "Soup restored originals after an incomplete update");
     }
     soup_catalog();
