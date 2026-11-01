@@ -38,6 +38,9 @@ source sizes to remain unchanged for one second. Before creating backups it
 checks exclusive-create semantics on a disposable private probe file. If the
 camera does not honour exclusive creation, processing stops and reports that
 backups cannot be safely created. The probe never touches a photo.
+New files use the 5D2.212 firmware's native create/exclusive flags (`0x100`
+and `0x400`), verified from its file-opening code; ML's generic POSIX flag
+values do not match this camera.
 
 Each member of a RAW+JPEG pair gets an immutable backup, verified by complete
 byte comparison. Candidate images are prepared in

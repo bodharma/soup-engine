@@ -11,6 +11,9 @@
 #include "crc32.h"
 #include <stddef.h>
 
+/* 5D2.212 ROM 0xFFB92AE0: create=0x100, exclusive=0x400; ML's POSIX values differ. */
+#define SOUP_NEW_FILE_FLAGS (O_RDWR | 0x100u | 0x400u)
+
 static int soup_lock(void)
 {
 #ifdef SOUP_HOST_TEST
@@ -98,7 +101,7 @@ int soup_storage_check(void)
     if (f || is_file(probe)) goto done;
     buffer = fio_malloc(sizeof(token));
     if (!buffer) goto done;
-    f = FIO_OpenFile(probe, O_RDWR | O_CREAT | O_EXCL | O_SYNC);
+    f = FIO_OpenFile(probe, SOUP_NEW_FILE_FLAGS);
     if (!f) goto done;
     created = 1;
     if (FIO_GetFileSize(probe, &size) || size) goto done;
@@ -109,7 +112,7 @@ int soup_storage_check(void)
     if (!f || FIO_GetFileSize(probe, &size) || size != sizeof(token) ||
         soup_read_at(f, 0, buffer, sizeof(token)) || memcmp(buffer, token, sizeof(token))) goto done;
     FIO_CloseFile(f); f = 0;
-    second = FIO_OpenFile(probe, O_RDWR | O_CREAT | O_EXCL | O_SYNC);
+    second = FIO_OpenFile(probe, SOUP_NEW_FILE_FLAGS);
     if (second) goto done;
     f = FIO_OpenFile(probe, O_RDONLY | O_SYNC);
     if (!f || FIO_GetFileSize(probe, &size) || size != sizeof(token) ||
@@ -127,7 +130,7 @@ done:
 FILE *soup_create_new(const char *path)
 {
     if (soup_storage_check()) return 0;
-    return FIO_OpenFile(path, O_RDWR | O_CREAT | O_EXCL | O_SYNC);
+    return FIO_OpenFile(path, SOUP_NEW_FILE_FLAGS);
 }
 
 int soup_receipt_pending(void)

@@ -47,14 +47,19 @@ int is_file(const char *p)
 int is_dir(const char *p) { struct stat s; return !stat(p, &s) && S_ISDIR(s.st_mode); }
 FILE *FIO_OpenFile(const char *p, unsigned mode)
 {
-    assert(!(mode & ~(O_RDWR | O_SYNC | O_CREAT | O_EXCL)));
-    if ((mode & O_RDWR) && !strncmp(p, "DCIM/", 5)) assert(locked);
-    if (mode & O_CREAT) {
+    FILE *f;
+    /* 5D2.212 ROM _FIO_OpenFile bits, deliberately independent of the
+     * ML header: create=0x100, truncate=0x200, exclusive=0x400. The old
+     * ML 0x40/0x80 bits do not create a missing native file. */
+    assert(!(mode & ~(2u | 0x40u | 0x80u | 0x100u | 0x200u | 0x400u | 0x1000u)));
+    if ((mode & 2u) && !strncmp(p, "DCIM/", 5)) assert(locked);
+    if (mode & 0x100u) {
         assert(strncmp(p, "DCIM/", 5));
-        if ((mode & O_EXCL) && !ignore_exclusive) return track(fopen(p, "w+bx"), p);
-        { struct stat st; return track(fopen(p, !stat(p, &st) ? "r+b" : "w+b"), p); }
-    }
-    return track(fopen(p, mode & O_RDWR ? "r+b" : "rb"), p);
+        if ((mode & 0x400u) && !ignore_exclusive) f = fopen(p, "w+bx");
+        else { struct stat st; f = fopen(p, !stat(p, &st) ? "r+b" : "w+b"); }
+    } else f = fopen(p, mode & 2u ? "r+b" : "rb");
+    if (f && (mode & 0x200u) && ftruncate(fileno(f), 0)) { fclose(f); return NULL; }
+    return track(f, p);
 }
 FILE *FIO_CreateFile(const char *p)
 {
@@ -300,8 +305,16 @@ int main(int argc, char **argv)
             assert(soup_transaction_commit(&tx) == -1 && is_file(SOUP_RECOVERY));
             if (k == 1) {
                 for (int j = 1; j <= 2; j++) {
-                    write_budget = boundary + 1024 * j;
-                    assert(soup_recover_pending() == -1 && is_file(SOUP_RECOVERY));
+                    int rc, jpeg_restored = !soup_equal_files(tx.files[0].source, tx.files[0].backup);
+                    /* The first recovery restores JPEG; later recoveries
+                     * skip it, so only the RAW write budget remains. */
+                    write_budget = (j == 1 ? boundary : 0) + 1024 * j;
+                    rc = soup_recover_pending();
+                    if (rc != -1 || !is_file(SOUP_RECOVERY))
+                        fprintf(stderr, "RAW rollback %d: JPEG already restored=%d, result=%d, receipt=%d, unused write budget=%ld\n",
+                                j, jpeg_restored, rc, is_file(SOUP_RECOVERY), write_budget);
+                    assert(rc == -1 && is_file(SOUP_RECOVERY));
+                    assert(!soup_equal_files(tx.files[0].source, tx.files[0].backup));
                 }
             }
             clear_faults(); assert(soup_recover_pending() == 1 && !is_file(SOUP_RECOVERY));
