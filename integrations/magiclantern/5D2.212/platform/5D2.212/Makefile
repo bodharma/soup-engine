@@ -15,6 +15,7 @@ ML_PICSTYLE_AUTO = n
 SOUP_ENGINE := $(TOP_DIR)/../../engine
 ML_SRC_EXTRA_OBJS = $(BUILD_DIR)/afma.o $(BUILD_DIR)/asm.o \
     $(BUILD_DIR)/film_menu.o $(BUILD_DIR)/film_develop.o \
+    $(BUILD_DIR)/film_transaction.o $(BUILD_DIR)/film_tiff.o $(BUILD_DIR)/crc32.o \
     $(BUILD_DIR)/soup_se.o $(BUILD_DIR)/soup_cr2.o \
     $(BUILD_DIR)/soup_jpeg_dec.o $(BUILD_DIR)/soup_jpeg_enc.o \
     $(BUILD_DIR)/soup_look.o $(BUILD_DIR)/soup_stock.o \
@@ -28,4 +29,7 @@ $(BUILD_DIR)/soup_%.o: $(SOUP_ENGINE)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CDEPS_FLAGS) -I$(SOUP_ENGINE) -c -o $@ $<
 
 $(BUILD_DIR)/film_develop.o: $(SRC_DIR)/film_develop.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CDEPS_FLAGS) -I$(SOUP_ENGINE) -c -o $@ $< $(INCLUDE_ARGS) $(LFLAGS)
+
+$(BUILD_DIR)/film_tiff.o: $(SRC_DIR)/film_tiff.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CDEPS_FLAGS) -I$(SOUP_ENGINE) -c -o $@ $< $(INCLUDE_ARGS) $(LFLAGS)

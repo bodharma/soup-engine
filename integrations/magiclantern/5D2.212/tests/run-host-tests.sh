@@ -15,13 +15,15 @@ if [ -n "$(ls -A "$work")" ]; then
 fi
 cc=${CC:-cc}
 "$cc" -std=c99 -O1 -g -Wall -Wextra -DSOUP_HOST_TEST \
-    -I"$tests" -I"$repo/src/engine" \
+    -I"$tests" -I"$tests/../src" -I"$repo/src/engine" -I"$repo/src/vendor/magiclantern/src" \
     "$tests/test-5d2.c" "$tests/../src/film_develop.c" \
+    "$tests/../src/film_transaction.c" "$tests/../src/film_tiff.c" \
+    "$repo/src/vendor/magiclantern/src/crc32.c" \
     "$repo/src/engine/se.c" "$repo/src/engine/cr2.c" \
     "$repo/src/engine/jpeg_dec.c" "$repo/src/engine/jpeg_enc.c" \
     "$repo/src/engine/look.c" "$repo/src/engine/stock.c" \
     "$repo/src/engine/wb.c" "$repo/src/engine/color.c" \
     "$repo/src/engine/grade.c" "$repo/src/engine/lut.c" \
     -lm -o "$work/test-5d2"
-"$work/test-5d2" "$1" "$2" "$repo/src/stocks/classicchrome.fs" "$work"
+"$work/test-5d2" "$1" "$2" "$repo/src/stocks/acros.fs" "$work"
 printf '%s\n' "Host test files: $work"

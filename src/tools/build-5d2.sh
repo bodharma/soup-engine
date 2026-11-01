@@ -20,7 +20,7 @@ if [ "$(git -C "$ml" rev-parse HEAD)" != "$pin" ]; then
     exit 1
 fi
 cp "$overlay/platform/5D2.212/Makefile" "$ml/platform/5D2.212/Makefile"
-cp "$overlay/src/film_menu.c" "$overlay/src/film_develop.c" "$ml/src/"
+cp "$overlay/src/"*.c "$overlay/src/"*.h "$ml/src/"
 if [ "$(uname -s)" = Darwin ]; then
     set -- 'STAT_CMD=stat -f "%N: %z bytes"'
 else

@@ -1404,10 +1404,13 @@ static int test_srgb_roundtrip(void)
 
 static int g_sink_bytes;
 static int g_sink_soi, g_sink_eoi, g_sink_last;
+static uint8_t g_sink_data[32768];
 static int count_sink(void *ctx, const uint8_t *d, size_t n)
 {
     size_t i;
     (void)ctx;
+    if (n > sizeof g_sink_data - (size_t)g_sink_bytes) return -1;
+    memcpy(g_sink_data + g_sink_bytes, d, n);
     for (i = 0; i < n; i++) {
         g_sink_last = ((g_sink_last & 0xff) << 8) | d[i];
         g_sink_bytes++;
@@ -1417,14 +1420,195 @@ static int count_sink(void *ctx, const uint8_t *d, size_t n)
     return 0;
 }
 
+/* Test-only TIFF traversal: read tags from the emitted APP1, independently
+ * of the encoder's directory layout and offsets. */
+typedef struct { const uint8_t *p; size_t len; } jpeg_test_tiff;
+
+static unsigned jt_u16(const uint8_t *p)
+{
+    return (unsigned)p[0] | (unsigned)p[1] << 8;
+}
+
+static uint32_t jt_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static const uint8_t *jt_value(const jpeg_test_tiff *t, const uint8_t *e)
+{
+    unsigned type = jt_u16(e + 2);
+    uint32_t count = jt_u32(e + 4), off;
+    size_t unit, bytes;
+    switch (type) {
+    case 1: case 2: case 7: unit = 1; break;
+    case 3: unit = 2; break;
+    case 4: unit = 4; break;
+    case 5: unit = 8; break;
+    default: return NULL;
+    }
+    if (!count || count > t->len / unit) return NULL;
+    bytes = (size_t)count * unit;
+    if (bytes <= 4) return e + 8;
+    off = jt_u32(e + 8);
+    if (off < 8 || (off & 1) || off > t->len || bytes > t->len - off) return NULL;
+    return t->p + off;
+}
+
+static int jt_ifd(const jpeg_test_tiff *t, uint32_t off, uint32_t *next)
+{
+    unsigned n, i, prev = 0;
+    if (off < 8 || (off & 1) || off > t->len || t->len - off < 6) return 0;
+    n = jt_u16(t->p + off);
+    if (n > (t->len - off - 6) / 12) return 0;
+    for (i = 0; i < n; i++) {
+        const uint8_t *e = t->p + off + 2 + 12 * i;
+        const uint8_t *v = jt_value(t, e);
+        unsigned tag = jt_u16(e);
+        if (!v || (i && tag <= prev)) return 0;
+        if (jt_u16(e + 2) == 2 && v[jt_u32(e + 4) - 1] != 0) return 0;
+        if (jt_u16(e + 2) == 5 && jt_u32(v + 4) == 0) return 0;
+        prev = tag;
+    }
+    *next = jt_u32(t->p + off + 2 + 12 * n);
+    return 1;
+}
+
+static const uint8_t *jt_tag(const jpeg_test_tiff *t, uint32_t off,
+                             unsigned tag, unsigned type, uint32_t count)
+{
+    unsigned i, n = jt_u16(t->p + off);
+    for (i = 0; i < n; i++) {
+        const uint8_t *e = t->p + off + 2 + 12 * i;
+        if (jt_u16(e) == tag)
+            return jt_u16(e + 2) == type && jt_u32(e + 4) == count ? jt_value(t, e) : NULL;
+    }
+    return NULL;
+}
+
+static int jt_number(const jpeg_test_tiff *t, uint32_t off,
+                      unsigned tag, unsigned type, uint32_t expected)
+{
+    const uint8_t *p = jt_tag(t, off, tag, type, 1);
+    return p && (type == 3 ? jt_u16(p) : jt_u32(p)) == expected;
+}
+
+static int jt_bytes(const jpeg_test_tiff *t, uint32_t off, unsigned tag,
+                    unsigned type, uint32_t count, const void *expected)
+{
+    const uint8_t *p = jt_tag(t, off, tag, type, count);
+    return p && memcmp(p, expected, count) == 0;
+}
+
+static int jt_resolution(const jpeg_test_tiff *t, uint32_t off)
+{
+    const uint8_t *x = jt_tag(t, off, 0x011a, 5, 1);
+    const uint8_t *y = jt_tag(t, off, 0x011b, 5, 1);
+    return x && y && jt_u32(x) == 72 && jt_u32(x + 4) == 1 &&
+           jt_u32(y) == 72 && jt_u32(y + 4) == 1 && jt_number(t, off, 0x0128, 3, 2);
+}
+
+static int jt_jpeg_dimensions(const uint8_t *p, size_t len, int w, int h)
+{
+    size_t at = 2;
+    if (len < 4 || p[0] != 0xff || p[1] != 0xd8 ||
+        p[len - 2] != 0xff || p[len - 1] != 0xd9) return 0;
+    while (at + 4 <= len) {
+        unsigned marker, n;
+        if (p[at++] != 0xff) return 0;
+        marker = p[at++];
+        n = (unsigned)p[at] << 8 | p[at + 1];
+        if (n < 2 || n > len - at || marker == 0xda || marker == 0xdd) return 0;
+        if (marker == 0xc0)
+            return n == 17 && p[at + 2] == 8 &&
+                   ((unsigned)p[at + 3] << 8 | p[at + 4]) == (unsigned)h &&
+                   ((unsigned)p[at + 5] << 8 | p[at + 6]) == (unsigned)w &&
+                   p[at + 7] == 3 && p[at + 9] == 0x21 &&
+                   p[at + 12] == 0x11 && p[at + 15] == 0x11;
+        at += n;
+    }
+    return 0;
+}
+
+static int jt_exif(int w, int h, int orientation, const char *date,
+                    const uint8_t *thumb, int thumb_len)
+{
+    static const uint8_t components[4] = { 1, 2, 3, 0 };
+    jpeg_test_tiff t;
+    const uint8_t *p;
+    uint32_t ifd0, exif, interop, th, next, offset, len;
+    unsigned app_len;
+    if (g_sink_bytes < 20 || g_sink_data[2] != 0xff || g_sink_data[3] != 0xe1) return 0;
+    app_len = (unsigned)g_sink_data[4] << 8 | g_sink_data[5];
+    if (app_len < 16 || app_len > 8194 || app_len > (unsigned)g_sink_bytes - 4 ||
+        memcmp(g_sink_data + 6, "Exif\0\0II\x2a\0", 10) != 0) return 0;
+    t.p = g_sink_data + 12; t.len = app_len - 8;
+    ifd0 = jt_u32(t.p + 4);
+    if (!jt_ifd(&t, ifd0, &th) ||
+        !jt_number(&t, ifd0, 0x0112, 3, (uint32_t)orientation) ||
+        !jt_resolution(&t, ifd0) || !jt_number(&t, ifd0, 0x0213, 3, 1) ||
+        !jt_tag(&t, ifd0, 0x010f, 2, 6) || !jt_tag(&t, ifd0, 0x0110, 2, 13) ||
+        !jt_bytes(&t, ifd0, 0x0132, 2, 20, date)) return 0;
+    p = jt_tag(&t, ifd0, 0x8769, 4, 1);
+    if (!p) return 0;
+    exif = jt_u32(p);
+    if (!jt_ifd(&t, exif, &next) || next ||
+        !jt_bytes(&t, exif, 0x9000, 7, 4, "0221") ||
+        !jt_bytes(&t, exif, 0x9003, 2, 20, date) ||
+        !jt_bytes(&t, exif, 0x9004, 2, 20, date) ||
+        !jt_bytes(&t, exif, 0x9101, 7, 4, components) ||
+        !jt_bytes(&t, exif, 0xa000, 7, 4, "0100") ||
+        !jt_number(&t, exif, 0xa001, 3, 1) ||
+        !jt_number(&t, exif, 0xa002, 4, (uint32_t)w) ||
+        !jt_number(&t, exif, 0xa003, 4, (uint32_t)h)) return 0;
+    p = jt_tag(&t, exif, 0xa005, 4, 1);
+    if (!p) return 0;
+    interop = jt_u32(p);
+    if (!jt_ifd(&t, interop, &next) || next ||
+        !jt_bytes(&t, interop, 1, 2, 4, "R98") ||
+        !jt_bytes(&t, interop, 2, 7, 4, "0100")) return 0;
+    if (!thumb) return th == 0;
+    if (!jt_ifd(&t, th, &next) || next || !jt_resolution(&t, th) ||
+        !jt_number(&t, th, 0x0103, 3, 6) ||
+        !jt_number(&t, th, 0x0202, 4, (uint32_t)thumb_len)) return 0;
+    p = jt_tag(&t, th, 0x0201, 4, 1);
+    if (!p) return 0;
+    offset = jt_u32(p); len = (uint32_t)thumb_len;
+    return offset >= 8 && !(offset & 1) && offset <= t.len && len <= t.len - offset &&
+           memcmp(t.p + offset, thumb, len) == 0 &&
+           jt_jpeg_dimensions(t.p + offset, len, 160, 120);
+}
+
 static int test_jpeg_structure(void)
 {
     enum { W = 61, H = 37 };      /* deliberately not multiples of 8 */
     static uint8_t rgb[H * W * 3];
-    static uint8_t strip[8 * W * 3];
-    static se_jpeg j;            /* ~5 KB, keep it off the stack */
+    static uint8_t strip[8 * 160 * 3], thumb_row[160 * 3], thumb[8192];
+    static char long_make[8193];
+    static struct {
+        uint8_t before[32];
+        se_jpeg j;
+        uint8_t after[32];
+    } guarded;
+    se_jpeg *j = &guarded.j;      /* keep the encoder off the stack */
     se_jpeg_exif   ex;
-    int x, y;
+    int x, y, k, thumb_len, base_tiff_len, make_len;
+    static const int orientations[] = { 0, 1, 3, 6, 8, -1, 9 };
+    static const char unknown_date[20] = "                   ";
+
+    memset(&guarded, 0xa5, sizeof guarded);
+    for (x = 0; x < 160; x++) {
+        thumb_row[x * 3] = (uint8_t)x;
+        thumb_row[x * 3 + 1] = 80;
+        thumb_row[x * 3 + 2] = 200;
+    }
+    g_sink_bytes = g_sink_soi = g_sink_eoi = g_sink_last = 0;
+    if (se_jpeg_begin(j, 160, 120, 60, strip, NULL, count_sink, NULL) != SE_OK) return 0;
+    for (y = 0; y < 120; y++)
+        if (se_jpeg_write_rows(j, thumb_row, 1) != SE_OK) return 0;
+    if (se_jpeg_end(j) != SE_OK || g_sink_bytes > (int)sizeof thumb) return 0;
+    thumb_len = g_sink_bytes;
+    memcpy(thumb, g_sink_data, (size_t)thumb_len);
 
     for (y = 0; y < H; y++)
         for (x = 0; x < W; x++) {
@@ -1438,15 +1622,56 @@ static int test_jpeg_structure(void)
     ex.software = "Soup Engine TEST";
     ex.datetime = "2026:10:18 12:00:00";
     ex.exposure_time = 1.0f / 250.0f; ex.aperture = 8.0f; ex.iso = 100;
+    ex.orientation = 6;
+    ex.thumb = thumb; ex.thumb_len = thumb_len;
 
     g_sink_bytes = g_sink_soi = g_sink_eoi = g_sink_last = 0;
-    if (se_jpeg_begin(&j, W, H, 90, strip, &ex, count_sink, NULL) != SE_OK) return 0;
-    if (se_jpeg_write_rows(&j, rgb, H) != SE_OK) return 0;
-    if (se_jpeg_end(&j) != SE_OK) return 0;
+    if (se_jpeg_begin(j, W, H, 90, strip, &ex, count_sink, NULL) != SE_OK) return 0;
+    if (se_jpeg_write_rows(j, rgb, H) != SE_OK) return 0;
+    if (se_jpeg_end(j) != SE_OK) return 0;
+    if (!g_sink_soi || !g_sink_eoi || !jt_jpeg_dimensions(g_sink_data, g_sink_bytes, W, H) ||
+        !jt_exif(W, H, 6, ex.datetime, thumb, thumb_len)) return 0;
 
-    printf("        %dx%d encoded to %d bytes, SOI=%d EOI=%d\n",
-           W, H, g_sink_bytes, g_sink_soi, g_sink_eoi);
-    return g_sink_soi && g_sink_eoi && g_sink_bytes > 200;
+    printf("        %dx%d JPEG: parsed DCF tags, orientation and 160x120 thumbnail\n", W, H);
+    ex.thumb = NULL; ex.thumb_len = 0;
+    ex.software = NULL;
+    ex.exposure_time = ex.aperture = 0; ex.iso = 0;
+    for (k = 0; k < (int)(sizeof orientations / sizeof orientations[0]); k++) {
+        int expected = orientations[k] >= 1 && orientations[k] <= 8 ? orientations[k] : 1;
+        ex.orientation = orientations[k];
+        ex.datetime = k == 0 ? NULL : k == 1 ? "" : "short";
+        g_sink_bytes = g_sink_soi = g_sink_eoi = g_sink_last = 0;
+        if (se_jpeg_begin(j, W, H, 90, strip, &ex, count_sink, NULL) != SE_OK ||
+            se_jpeg_write_rows(j, rgb, H) != SE_OK || se_jpeg_end(j) != SE_OK ||
+            !jt_exif(W, H, expected, unknown_date, NULL, 0)) return 0;
+    }
+
+    /* A payload exactly filling exifbuf succeeds; the next ASCII byte
+     * requires another aligned word and fails before the sink is called. */
+    base_tiff_len = ((int)g_sink_data[4] << 8 | g_sink_data[5]) - 8;
+    make_len = (int)sizeof j->exifbuf - 6 - base_tiff_len + 6;
+    if (make_len < 6 || make_len >= (int)sizeof long_make) return 0;
+    memset(long_make, 'X', sizeof long_make);
+    long_make[make_len - 1] = 0;
+    ex.make = long_make;
+    g_sink_bytes = g_sink_soi = g_sink_eoi = g_sink_last = 0;
+    if (se_jpeg_begin(j, W, H, 90, strip, &ex, count_sink, NULL) != SE_OK ||
+        se_jpeg_write_rows(j, rgb, H) != SE_OK || se_jpeg_end(j) != SE_OK ||
+        ((unsigned)g_sink_data[4] << 8 | g_sink_data[5]) != sizeof j->exifbuf + 2) return 0;
+    long_make[make_len - 1] = 'X'; long_make[make_len] = 0;
+    g_sink_bytes = 0;
+    if (se_jpeg_begin(j, W, H, 90, strip, &ex, count_sink, NULL) != SE_E_NOMEM ||
+        g_sink_bytes) return 0;
+    ex.make = "Canon"; ex.thumb = thumb;
+    for (k = 0; k < 2; k++) {
+        ex.thumb_len = k ? -1 : 0x7fffffff;
+        if (se_jpeg_begin(j, W, H, 90, strip, &ex, count_sink, NULL) != SE_E_NOMEM ||
+            g_sink_bytes) return 0;
+    }
+    for (k = 0; k < (int)sizeof guarded.before; k++)
+        if (guarded.before[k] != 0xa5 || guarded.after[k] != 0xa5) return 0;
+    printf("        checked missing dates, orientation defaults and the 8192-byte EXIF boundary\n");
+    return 1;
 }
 
 static int test_ui_navigation(void)

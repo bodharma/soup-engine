@@ -1,21 +1,24 @@
-/* Soup's native ML integration. Camera settings and source photos stay untouched. */
+/* Native PLAY updates start disabled; immutable originals are backed up first. */
 #include "dryos.h"
 #include "config.h"
 #include "fio-ml.h"
 #include "menu.h"
 #include "notify_box.h"
+#include "film_transaction.h"
 
 #define SOUP_STOCKS 16
 #define SOUP_PATH 96
 
 static int soup_on;
+static int soup_recovery_ready;
 static CONFIG_INT("soup.stock", soup_stock, -1);
 static int soup_count;
 static char soup_files[SOUP_STOCKS][64];
 static char soup_names[SOUP_STOCKS][32];
 static const char *soup_choices[SOUP_STOCKS];
 
-int soup_is_on(void) { return soup_on && soup_count > 0; }
+int soup_is_on(void) { return soup_on && soup_recovery_ready && soup_count > 0; }
+void soup_disable_for_recovery(void) { soup_on = 0; soup_recovery_ready = 0; }
 
 int soup_stock_path(char *path, int size)
 {
@@ -68,14 +71,14 @@ static void soup_catalog(void)
 static struct menu_entry soup_menu[] = {
     {
         .name = "Soup Film",
-        .help = "Film JPEGs in ML/SOUP. Original photos are kept.",
+        .help = "Update PLAY after processing. Originals backed up in ML/SOUP.",
         .children = (struct menu_entry[]) {
             {
                 .name = "Enable",
                 .priv = &soup_on,
                 .max = 1,
                 .choices = CHOICES("OFF", "ON"),
-                .help = "Process new RAW, RAW+JPEG or JPEG photos at half size.",
+                .help = "Back up originals, then update JPEG/RAW playback previews.",
             },
             {
                 .name = "Stock",
@@ -96,6 +99,16 @@ static void soup_init(void *unused)
     (void)unused;
     while (!ml_started) msleep(100);
     msleep(2000);
+    {
+        int recovery;
+        do {
+            recovery = soup_recover_pending();
+            if (recovery == SOUP_RECOVERY_BUSY) msleep(250);
+        } while (recovery == SOUP_RECOVERY_BUSY);
+        soup_recovery_ready = recovery >= 0;
+        if (recovery < 0) NotifyBox(10000, "Soup recovery needs attention; processing disabled");
+        else if (recovery > 0) NotifyBox(8000, "Soup restored originals after an incomplete update");
+    }
     soup_catalog();
     if (!soup_count) {
         NotifyBox(5000, "Soup: no ML/FILM stocks found");
@@ -107,4 +120,4 @@ static void soup_init(void *unused)
     task_create("soup_worker", 0x1f, 0x10000, soup_worker, 0);
 }
 
-TASK_CREATE("soup_init", soup_init, 0, 0x1f, 0x2000);
+TASK_CREATE("soup_init", soup_init, 0, 0x1f, 0x10000);

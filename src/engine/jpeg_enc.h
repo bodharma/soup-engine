@@ -36,6 +36,7 @@ typedef struct {
     int   iso;               /* 0 to omit */
     const uint8_t *thumb;    /* JPEG thumbnail, or NULL */
     int   thumb_len;
+    int   orientation;       /* TIFF orientation 1..8; 0/invalid means 1 */
 } se_jpeg_exif;
 
 typedef struct {
@@ -78,6 +79,8 @@ typedef struct {
 /*
  * `strip` must point at 8 * width * 3 bytes of scratch owned by the caller
  * and must stay valid until se_jpeg_end().
+ * EXIF (including the thumbnail) must fit in 8192 bytes; otherwise returns
+ * SE_E_NOMEM before writing any output.
  */
 se_err se_jpeg_begin(se_jpeg *j, int width, int height, int quality,
                      uint8_t *strip, const se_jpeg_exif *exif,

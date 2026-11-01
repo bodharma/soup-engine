@@ -96,18 +96,19 @@ static void build_all_codes(void)
 
 /* ========================================================== EXIF ===== */
 /*
- * A minimal, standards-correct EXIF APP1 block: TIFF header, IFD0, and an
- * Exif sub-IFD. Values of four bytes or fewer live inline in the entry, as
- * TIFF requires; longer ones go in a data area after both directories.
+ * EXIF APP1 payload with DCF basic-file identification. Values of four
+ * bytes or fewer live inline; longer ones follow the reserved directories.
  */
+
+enum { EW_IFD0, EW_EXIF, EW_THUMB, EW_INTEROP, EW_IFDS };
 
 typedef struct {
     uint8_t *buf;
     int      cap;
     int      data;       /* cursor in the data area        */
-    int      n0, n1, nth;
-    int      ifd0, ifd1, ifd_th;
-    int      e0, e1, e_th;
+    int      failed;
+    int      count[EW_IFDS], ifd[EW_IFDS];
+    int      entry[EW_IFDS], limit[EW_IFDS];
 } exifw;
 
 static void ew_u16(uint8_t *p, unsigned v) { p[0] = (uint8_t)(v & 0xff); p[1] = (uint8_t)(v >> 8); }
@@ -120,19 +121,27 @@ static void ew_u32(uint8_t *p, uint32_t v)
 static int ew_blob(exifw *w, const void *src, int n)
 {
     int at = w->data;
-    if (at + n > w->cap) return -1;
+    if (w->failed) return -1;
+    if (n < 0 || at > w->cap || n > w->cap - at ||
+        ((n & 1) && n == w->cap - at)) {
+        w->failed = 1;
+        return -1;
+    }
     memcpy(w->buf + at, src, (size_t)n);
     w->data += n;
-    if (w->data & 1) w->data++;      /* keep the data area word aligned */
+    if (w->data & 1) w->buf[w->data++] = 0; /* word alignment */
     return at;
 }
 
-/* type: 2 ASCII, 3 SHORT, 4 LONG, 5 RATIONAL */
+/* type: 2 ASCII, 3 SHORT, 4 LONG, 5 RATIONAL, 7 UNDEFINED */
 static void ew_entry(exifw *w, int which, unsigned tag, unsigned type,
                      uint32_t count, const void *data, int inline_bytes)
 {
-    int *cur = which == 2 ? &w->e_th : which ? &w->e1 : &w->e0;
-    uint8_t *p = w->buf + *cur;
+    int *cur = &w->entry[which];
+    uint8_t *p;
+    if (w->failed) return;
+    if (*cur > w->limit[which] - 12) { w->failed = 1; return; }
+    p = w->buf + *cur;
     ew_u16(p,     tag);
     ew_u16(p + 2, type);
     ew_u32(p + 4, count);
@@ -144,16 +153,16 @@ static void ew_entry(exifw *w, int which, unsigned tag, unsigned type,
         ew_u32(p + 8, at >= 0 ? (uint32_t)at : 0);
     }
     *cur += 12;
-    if (which == 2) w->nth++;
-    else if (which) w->n1++;
-    else w->n0++;
+    w->count[which]++;
 }
 
 static void ew_ascii(exifw *w, int which, unsigned tag, const char *s)
 {
     int n;
     if (!s || !*s) return;
-    n = (int)strlen(s) + 1;
+    for (n = 0; n < w->cap && s[n]; n++) {}
+    if (n == w->cap) { w->failed = 1; return; }
+    n++;
     ew_entry(w, which, tag, 2, (uint32_t)n, s, n);
 }
 
@@ -196,12 +205,23 @@ static void float_to_rational(float v, uint32_t *num, uint32_t *den)
 static int build_exif(uint8_t *out, int cap, const se_jpeg_exif *x,
                       int width, int height)
 {
+    static const int slots[EW_IFDS] = { 10, 12, 6, 2 };
+    static const uint8_t components[4] = { 1, 2, 3, 0 };
+    static const char unknown_date[20] = "                   ";
     exifw w;
     uint8_t *tiff;
     int hdr = 6;               /* "Exif\0\0" */
-    int total;
+    int i, cursor, have_thumb = x->thumb && x->thumb_len > 0;
+    const char *date = x->datetime;
 
-    if (cap < 256) return 0;
+    if (cap < 6 || (x->thumb && x->thumb_len <= 0) ||
+        (!x->thumb && x->thumb_len != 0)) return 0;
+    /* DCF dates are always 20-byte ASCII, including their terminator. */
+    if (date) {
+        for (i = 0; i < 19 && date[i]; i++) {}
+        if (i != 19 || date[19]) date = NULL;
+    }
+    if (!date) date = unknown_date;
     memcpy(out, "Exif\0\0", 6);
     tiff = out + hdr;
 
@@ -209,48 +229,60 @@ static int build_exif(uint8_t *out, int cap, const se_jpeg_exif *x,
     w.buf = tiff;
     w.cap = cap - hdr;
 
-    /* TIFF header: little endian, first IFD at offset 8 */
+    /*
+     * Keep every directory outside the data area, including its next-IFD
+     * pointer. Optional entries may leave unused slots, which are zeroed.
+     */
+    cursor = 8;
+    for (i = 0; i < EW_IFDS; i++) {
+        int n = i == EW_THUMB && !have_thumb ? 0 : slots[i];
+        w.ifd[i] = cursor;
+        w.entry[i] = cursor + 2;
+        w.limit[i] = cursor + 2 + 12 * n;
+        cursor = w.limit[i] + 4;
+    }
+    if (cursor > w.cap) return 0;
+    memset(tiff, 0, (size_t)cursor);
+    w.data = cursor;
+
+    /* TIFF header: little endian, first IFD at offset 8. */
     tiff[0] = 'I'; tiff[1] = 'I';
     ew_u16(tiff + 2, 42);
-    ew_u32(tiff + 4, 8);
+    ew_u32(tiff + 4, (uint32_t)w.ifd[EW_IFD0]);
 
-    /*
-     * Reserve space for both directories before any data is written.
-     * Reserve generously: entries are optional, so the counts are only
-     * known at the end, and the terminators are placed then.
-     */
-    #define IFD0_SLOTS 8
-    #define EXIF_SLOTS 10
-    #define THUMB_SLOTS 6
-    w.ifd0 = 8;
-    w.e0   = w.ifd0 + 2;
-    w.ifd1 = w.ifd0 + 2 + 12 * IFD0_SLOTS + 4;
-    w.e1   = w.ifd1 + 2;
-    w.ifd_th = w.ifd1 + 2 + 12 * EXIF_SLOTS + 4;
-    w.e_th   = w.ifd_th + 2;
-    w.data   = w.ifd_th + 2 + 12 * (x->thumb ? THUMB_SLOTS : 0) + 4;
-
-    ew_ascii(&w, 0, 0x010f, x->make);
-    ew_ascii(&w, 0, 0x0110, x->model);
-    ew_short(&w, 0, 0x0112, 1);                 /* Orientation: normal */
-    ew_ascii(&w, 0, 0x0131, x->software);
-    ew_ascii(&w, 0, 0x0132, x->datetime);
-    ew_long (&w, 0, 0x8769, (uint32_t)w.ifd1);  /* -> Exif IFD */
+    ew_ascii(&w, EW_IFD0, 0x010f, x->make && *x->make ? x->make : "Unknown");
+    ew_ascii(&w, EW_IFD0, 0x0110, x->model && *x->model ? x->model : "Unknown");
+    ew_short(&w, EW_IFD0, 0x0112,
+             x->orientation >= 1 && x->orientation <= 8 ? (unsigned)x->orientation : 1);
+    ew_rational(&w, EW_IFD0, 0x011a, 72, 1);    /* XResolution */
+    ew_rational(&w, EW_IFD0, 0x011b, 72, 1);    /* YResolution */
+    ew_short(&w, EW_IFD0, 0x0128, 2);          /* inches */
+    ew_ascii(&w, EW_IFD0, 0x0131, x->software);
+    ew_ascii(&w, EW_IFD0, 0x0132, date);
+    ew_short(&w, EW_IFD0, 0x0213, 1);          /* centered chroma */
+    ew_long (&w, EW_IFD0, 0x8769, (uint32_t)w.ifd[EW_EXIF]);
 
     if (x->exposure_time > 0.0f) {
         uint32_t n, d;
         float_to_rational(x->exposure_time, &n, &d);
-        ew_rational(&w, 1, 0x829a, n, d);
+        ew_rational(&w, EW_EXIF, 0x829a, n, d);
     }
     if (x->aperture > 0.0f)
-        ew_rational(&w, 1, 0x829d, (uint32_t)(x->aperture * 10.0f + 0.5f), 10);
+        ew_rational(&w, EW_EXIF, 0x829d, (uint32_t)(x->aperture * 10.0f + 0.5f), 10);
     if (x->iso > 0)
-        ew_short(&w, 1, 0x8827, (unsigned)x->iso);
-    ew_ascii(&w, 1, 0x9003, x->datetime);       /* DateTimeOriginal  */
-    ew_ascii(&w, 1, 0x9004, x->datetime);       /* DateTimeDigitized */
-    ew_short(&w, 1, 0xa001, 1);                 /* ColorSpace: sRGB  */
-    ew_long (&w, 1, 0xa002, (uint32_t)width);
-    ew_long (&w, 1, 0xa003, (uint32_t)height);
+        ew_short(&w, EW_EXIF, 0x8827, (unsigned)x->iso);
+    ew_entry(&w, EW_EXIF, 0x9000, 7, 4, "0221", 4);
+    ew_ascii(&w, EW_EXIF, 0x9003, date);         /* DateTimeOriginal */
+    ew_ascii(&w, EW_EXIF, 0x9004, date);         /* DateTimeDigitized */
+    ew_entry(&w, EW_EXIF, 0x9101, 7, 4, components, 4);
+    ew_entry(&w, EW_EXIF, 0xa000, 7, 4, "0100", 4);
+    ew_short(&w, EW_EXIF, 0xa001, 1);           /* sRGB */
+    ew_long (&w, EW_EXIF, 0xa002, (uint32_t)width);
+    ew_long (&w, EW_EXIF, 0xa003, (uint32_t)height);
+    ew_long (&w, EW_EXIF, 0xa005, (uint32_t)w.ifd[EW_INTEROP]);
+
+    ew_entry(&w, EW_INTEROP, 0x0001, 2, 4, "R98", 4);
+    ew_entry(&w, EW_INTEROP, 0x0002, 7, 4, "0100", 4);
 
     /*
      * Entry counts, and the "no next IFD" terminator immediately after the
@@ -258,29 +290,26 @@ static int build_exif(uint8_t *out, int cap, const se_jpeg_exif *x,
      * then expects the pointer right there, so it cannot sit at the end of
      * the reserved space.
      */
-    if (x->thumb && x->thumb_len > 0) {
+    if (have_thumb) {
         int at = ew_blob(&w, x->thumb, x->thumb_len);
         if (at >= 0) {
-            ew_short(&w, 2, 0x0103, 6);                  /* JPEG thumbnail */
-            ew_long (&w, 2, 0x0201, (uint32_t)at);
-            ew_long (&w, 2, 0x0202, (uint32_t)x->thumb_len);
+            ew_short(&w, EW_THUMB, 0x0103, 6);          /* JPEG thumbnail */
+            ew_rational(&w, EW_THUMB, 0x011a, 72, 1);
+            ew_rational(&w, EW_THUMB, 0x011b, 72, 1);
+            ew_short(&w, EW_THUMB, 0x0128, 2);
+            ew_long (&w, EW_THUMB, 0x0201, (uint32_t)at);
+            ew_long (&w, EW_THUMB, 0x0202, (uint32_t)x->thumb_len);
         }
     }
 
-    ew_u16(tiff + w.ifd0, (unsigned)w.n0);
-    ew_u32(tiff + w.ifd0 + 2 + 12 * w.n0, w.nth ? (uint32_t)w.ifd_th : 0);
-    ew_u16(tiff + w.ifd1, (unsigned)w.n1);
-    ew_u32(tiff + w.ifd1 + 2 + 12 * w.n1, 0);
-    if (w.nth) {
-        ew_u16(tiff + w.ifd_th, (unsigned)w.nth);
-        ew_u32(tiff + w.ifd_th + 2 + 12 * w.nth, 0);
+    if (w.failed) return 0;
+    for (i = 0; i < EW_IFDS; i++) {
+        ew_u16(tiff + w.ifd[i], (unsigned)w.count[i]);
+        ew_u32(tiff + w.entry[i],
+               i == EW_IFD0 && have_thumb ? (uint32_t)w.ifd[EW_THUMB] : 0);
     }
 
-    total = hdr + w.data;
-    return total;
-    #undef IFD0_SLOTS
-    #undef EXIF_SLOTS
-    #undef THUMB_SLOTS
+    return hdr + w.data;
 }
 
 /* ---------------------------------------------------------- output ---- */
@@ -537,11 +566,15 @@ se_err se_jpeg_begin(se_jpeg *j, int width, int height, int quality,
                      uint8_t *strip, const se_jpeg_exif *exif,
                      se_jpeg_sink sink, void *ctx)
 {
-    int i, scale;
+    int i, scale, exif_len = 0;
 
     if (width <= 0 || height <= 0 || !strip || !sink) return SE_E_BADFILE;
 
     memset(j, 0, sizeof *j);
+    if (exif) {
+        exif_len = build_exif(j->exifbuf, (int)sizeof j->exifbuf, exif, width, height);
+        if (!exif_len) return SE_E_NOMEM;
+    }
     build_all_codes();
 
     j->stride = width;
@@ -572,13 +605,10 @@ se_err se_jpeg_begin(se_jpeg *j, int width, int height, int quality,
     jo_u16(j, 0xffd8);
 
     /* APP1 EXIF, which must follow immediately */
-    if (exif) {
-        int n = build_exif(j->exifbuf, (int)sizeof j->exifbuf, exif, width, height);
-        if (n > 0) {
-            jo_u16(j, 0xffe1);
-            jo_u16(j, (unsigned)(n + 2));
-            jo_bytes(j, j->exifbuf, (size_t)n);
-        }
+    if (exif_len) {
+        jo_u16(j, 0xffe1);
+        jo_u16(j, (unsigned)(exif_len + 2));
+        jo_bytes(j, j->exifbuf, (size_t)exif_len);
     }
 
     /* DQT, written in zig-zag order as the standard requires */
