@@ -14,6 +14,15 @@ if [ -n "$(ls -A "$work")" ]; then
     exit 2
 fi
 cc=${CC:-cc}
+"$cc" -std=c99 -O1 -g -DSE_HOSTED -I"$repo/src/engine" \
+    "$repo/src/tools/lookcheck.c" "$repo/src/engine/look.c" \
+    "$repo/src/engine/stock.c" "$repo/src/engine/grade.c" "$repo/src/engine/lut.c" \
+    "$repo/src/engine/wb.c" "$repo/src/engine/color.c" "$repo/src/engine/se.c" \
+    -lm -o "$work/lookcheck"
+"$work/lookcheck"
+"$cc" -std=c99 -O1 -g -DSE_HOSTED -I"$repo/src/engine" \
+    "$repo/src/host/main.c" "$repo/src/engine/"*.c -lm -o "$work/filmdev"
+"$work/filmdev" selftest
 "$cc" -std=c99 -O1 -g -Wall -Wextra -DSOUP_HOST_TEST \
     -I"$tests" -I"$tests/../src" -I"$repo/src/engine" -I"$repo/src/vendor/magiclantern/src" \
     "$tests/test-5d2.c" "$tests/../src/film_develop.c" \

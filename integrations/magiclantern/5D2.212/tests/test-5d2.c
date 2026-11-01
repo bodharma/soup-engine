@@ -3,6 +3,7 @@
 #include "se.h"
 #include "stock.h"
 #include "jpeg_dec.h"
+#include "jpeg_enc.h"
 #include <assert.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -10,6 +11,7 @@
 #include <sys/wait.h>
 
 int soup_process_pair(const char *, const char *, int, se_stock *);
+int soup_process_pair_with_settings(const char *, const char *, int, se_stock *, const soup_settings *);
 int soup_finish_attempt(int, int *);
 int soup_frame_geometry(int, int, int *, int *, int *, int *, int *);
 
@@ -25,6 +27,10 @@ static uint64_t original_raw_hash, original_jpeg_hash;
 static uint8_t completion_bytes[4096];
 static size_t completion_size;
 static int indexed_writes, removals;
+static int all_writes;
+static int record_checkpoints, checkpoint_count, checkpoint_base_writes;
+static struct { char report[513]; int indexed; } checkpoint_reports[8];
+static struct { char name[13]; uint64_t hash; } custom_originals[4];
 static uint64_t file_hash(const char *);
 FILE *soup_create_new(const char *);
 
@@ -112,6 +118,7 @@ int FIO_ReadFile(FILE *f, void *p, size_t n)
 int FIO_WriteFile(FILE *f, const void *p, size_t n)
 {
     const char *path = name_of(f);
+    all_writes++;
     if (!strncmp(path, "DCIM/", 5)) {
         indexed_writes++;
         for (int i = 0; i < 32; i++) if (handles[i].file == f && !handles[i].backup_checked) {
@@ -120,8 +127,12 @@ int FIO_WriteFile(FILE *f, const void *p, size_t n)
             for (int raw = 0; raw < 2; raw++) {
                 snprintf(source, sizeof(source), "DCIM/100EOS5D/%.8s.%s", base, raw ? "CR2" : "JPG");
                 snprintf(backup, sizeof(backup), "ML/SOUP/ORIG/100EOS5D/%.8s.%s", base, raw ? "CR2" : "JPG");
-                if (is_file(source)) assert(is_file(backup) && file_hash(backup) ==
-                    (raw ? original_raw_hash : original_jpeg_hash));
+                if (is_file(source)) {
+                    uint64_t expected = raw ? original_raw_hash : original_jpeg_hash;
+                    const char *name = strrchr(source, '/') + 1;
+                    for (int k = 0; k < 4; k++) if (!strcmp(name, custom_originals[k].name)) expected = custom_originals[k].hash;
+                    assert(is_file(backup) && file_hash(backup) == expected);
+                }
             }
             handles[i].backup_checked = 1;
         }
@@ -141,7 +152,17 @@ int FIO_WriteFile(FILE *f, const void *p, size_t n)
         }
         write_budget -= (long)n;
     }
-    return (int)fwrite(p, 1, n, f);
+    {
+        int written = (int)fwrite(p, 1, n, f);
+        if (record_checkpoints && !strcmp(path, "ML/SOUP/DIAG.TXT") && written == 512) {
+            assert(checkpoint_count < 8);
+            memcpy(checkpoint_reports[checkpoint_count].report, p, 512);
+            checkpoint_reports[checkpoint_count].report[512] = 0;
+            checkpoint_reports[checkpoint_count].indexed = indexed_writes - checkpoint_base_writes;
+            checkpoint_count++;
+        }
+        return written;
+    }
 }
 void FIO_CloseFile(FILE *f)
 {
@@ -223,7 +244,7 @@ static int report_has(const char *text)
         if (!memcmp(data + i, text, len)) { found = 1; break; }
     free(data); return found;
 }
-typedef struct { int rows, width, spread; uint64_t visible; } decoded;
+typedef struct { int rows, width, spread; uint64_t visible, hash; } decoded;
 static int check_rows(void *ctx, const uint8_t *rgb, int rows, int width)
 {
     decoded *d = ctx; d->rows += rows; assert(width == d->width);
@@ -234,19 +255,23 @@ static int check_rows(void *ctx, const uint8_t *rgb, int rows, int width)
         if (b < min) min = b;
         if (max - min > d->spread) d->spread = max - min;
         if (max > 8) d->visible++;
+        for (int c = 0; c < 3; c++) d->hash = (d->hash ^ rgb[i * 3 + c]) * UINT64_C(1099511628211);
     }
     return 0;
 }
-static void check_jpeg_bytes(const uint8_t *p, size_t n, int width, int height)
+static uint64_t jpeg_pixels(const uint8_t *p, size_t n, int width, int height, int exact_neutral)
 {
     se_jdec_info info; se_arena arena; void *mem = malloc(4u << 20);
-    decoded d = {0, width, 0, 0}; assert(mem);
+    decoded d = {0, width, 0, 0, UINT64_C(14695981039346656037)}; assert(mem);
     assert(se_jpeg_dec_info(p, n, &info) == SE_OK && info.width == width && info.height == height);
     se_arena_init(&arena, mem, 4u << 20);
     assert(se_jpeg_decode(p, n, &arena, check_rows, &d, &info) == SE_OK);
     assert(d.rows == height && d.spread <= 3 && d.visible > (uint64_t)width * height / 20);
-    free(mem);
+    if (exact_neutral) assert(d.spread == 0);
+    free(mem); return d.hash;
 }
+static void check_jpeg_bytes(const uint8_t *p, size_t n, int width, int height)
+{ (void)jpeg_pixels(p, n, width, height, 0); }
 static uint32_t le32(const uint8_t *p)
 { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static unsigned le16(const uint8_t *p) { return p[0] | (unsigned)p[1] << 8; }
@@ -260,18 +285,19 @@ static uint32_t tag_long(const uint8_t *t, size_t n, uint32_t off, unsigned tag)
     }
     assert(!"missing LONG tag"); return 0;
 }
-static void check_jpeg(const char *path)
+static void check_jpeg_mode(const char *path, int exact_neutral)
 {
     size_t n, tn; uint8_t *p = file_bytes(path, &n); const uint8_t *t; uint32_t off, len, ifd;
-    check_jpeg_bytes(p, n, 2784, 1856);
+    (void)jpeg_pixels(p, n, 2784, 1856, exact_neutral);
     assert(n > 20 && p[2] == 0xff && p[3] == 0xe1 && !memcmp(p + 6, "Exif\0\0II", 8));
     tn = ((unsigned)p[4] << 8 | p[5]) - 8; t = p + 12; assert(tn <= n - 12);
     ifd = le32(t + 4); assert(ifd < tn && tn - ifd >= 6);
     assert(le16(t + ifd) <= (tn - ifd - 6) / 12);
     ifd = le32(t + ifd + 2 + 12 * le16(t + ifd));
     off = tag_long(t, tn, ifd, 0x201); len = tag_long(t, tn, ifd, 0x202);
-    assert(off <= tn && len <= tn - off); check_jpeg_bytes(t + off, len, 160, 120); free(p);
+    assert(off <= tn && len <= tn - off); (void)jpeg_pixels(t + off, len, 160, 120, exact_neutral); free(p);
 }
+static void check_jpeg(const char *path) { check_jpeg_mode(path, 0); }
 static void check_raw(const char *path, const char *original)
 {
     soup_raw_layout before, after; size_t a, b; uint8_t *old, *now;
@@ -312,6 +338,127 @@ static void assert_clean(const soup_transaction *tx)
     assert(!is_file(render) && !is_file(SOUP_RECOVERY) && !is_file(SOUP_CLEANUP));
     for (unsigned i = 0; i < 2; i++) if (tx->members & (1u << i))
         assert(!is_file(tx->files[i].backup) && !is_file(tx->files[i].stage));
+}
+static int fixture_sink(void *ctx, const uint8_t *bytes, size_t n)
+{ return fwrite(bytes, 1, n, (FILE *)ctx) == n ? 0 : -1; }
+static void make_neutral_fixture(const char *path)
+{
+    enum { W = 2784, H = 1856 };
+    static se_jpeg encoder;
+    uint8_t *strip = malloc(8 * W * 3), *row = malloc(W * 3);
+    se_jpeg_exif exif;
+    FILE *f = fopen(path, "wb"); unsigned state = 7;
+    assert(strip && row && f); memset(&exif, 0, sizeof(exif));
+    exif.make = "Synthetic"; exif.model = "Neutral fixture";
+    exif.software = "Synthetic B&W source"; exif.datetime = "2026:01:02 03:04:05"; exif.orientation = 6;
+    assert(se_jpeg_begin(&encoder, W, H, 98, strip, &exif, fixture_sink, f) == SE_OK);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int value;
+            state = state * 1664525u + 1013904223u;
+            value = 32 + (int)((state >> 24) * 191 / 255);
+            if (x >= W / 3 && x < W * 2 / 3 && y >= H / 3 && y < H * 2 / 3) value = 255;
+            row[x * 3] = row[x * 3 + 1] = row[x * 3 + 2] = (uint8_t)value;
+        }
+        assert(se_jpeg_write_rows(&encoder, row, 1) == SE_OK);
+    }
+    assert(se_jpeg_end(&encoder) == SE_OK && !fclose(f)); free(strip); free(row);
+}
+static uint64_t neutral_pixels(const char *path)
+{
+    size_t n; uint8_t *p = file_bytes(path, &n);
+    uint64_t hash = jpeg_pixels(p, n, 2784, 1856, 1); free(p); return hash;
+}
+static void test_baseline(void)
+{
+    soup_capture_baseline first, later;
+    int camera_number = 100;
+    assert(soup_capture_snapshot(NULL) == -1);
+    assert(!soup_capture_arm("DCIM/100EOS5D", "IMG_", camera_number));
+    camera_number = 101; busy = 1;
+    assert(!soup_capture_snapshot(&first) && first.number == 100 && camera_number == 101);
+    assert(!strcmp(first.directory, "DCIM/100EOS5D") && !strcmp(first.prefix, "IMG_")); busy = 0;
+    assert(!soup_capture_snapshot(&later) && later.number == first.number && later.generation == first.generation &&
+           !strcmp(later.directory, first.directory) && !strcmp(later.prefix, first.prefix));
+    assert(soup_capture_arm("DCIM/../bad", "IMG_", 100) == -1);
+    assert(soup_capture_arm("DCIM/100EOS5D", "IMG_", -1) == -1);
+    assert(soup_capture_arm("DCIM/100EOS5D", "IMG_", 10000) == -1);
+    assert(!soup_capture_snapshot(&later) && later.generation == first.generation && later.number == 100);
+    assert(!soup_capture_claim(first.generation));
+    assert(soup_capture_claim(first.generation) == -1);
+    assert(soup_capture_arm("DCIM/100EOS5D", "IMG_", 101) == -1);
+    soup_capture_disable();
+    assert(soup_capture_claim(first.generation) == -1);
+    assert(soup_capture_arm("DCIM/100EOS5D", "IMG_", 101) == -1);
+    soup_capture_release();
+    assert(soup_capture_claim(first.generation) == -1);
+    assert(!soup_capture_arm("DCIM/100EOS5D", "_MG_", 0));
+    assert(!soup_capture_snapshot(&later) && later.number == 0 && later.generation != first.generation);
+    assert(soup_capture_claim(first.generation) == -1 && !soup_capture_claim(later.generation));
+    soup_capture_release(); soup_capture_disable();
+    assert(soup_capture_claim(later.generation) == -1);
+    puts("Enable baseline helper retains the pre-shot counter through a busy interval.");
+}
+static void test_hybrid(const char *raw, const char *jpeg)
+{
+    const char *dir = "DCIM/100EOS5D";
+    soup_settings off = {SOUP_MODE_EFFECTS, 0, 1, 0, 1, 0, 1}, settings, saved;
+    soup_transaction tx;
+    uint64_t source_hash, source_pixels, same_capture = 0, first_pixels = 0;
+    char path[SOUP_PATH], date[24]; int orientation;
+    /* All zero means byte preservation, even for varied colour input. */
+    copy_file(raw, "DCIM/100EOS5D/IMG_0080.CR2"); copy_file(jpeg, "DCIM/100EOS5D/IMG_0080.JPG");
+    {
+        int writes = all_writes, deleted = removals;
+        saved = off;
+        assert(soup_process_pair_with_settings(dir, "IMG_", 80, NULL, &off) == 1);
+        assert(!memcmp(&saved, &off, sizeof(off)) && all_writes == writes && removals == deleted);
+        assert(file_hash("DCIM/100EOS5D/IMG_0080.CR2") == file_hash(raw));
+        assert(file_hash("DCIM/100EOS5D/IMG_0080.JPG") == file_hash(jpeg));
+        assert(!soup_transaction_init(&tx, dir, "IMG_", 80, 3)); assert_clean(&tx);
+    }
+    for (int k = 0; k < 2; k++) {
+        const char *pending = k ? SOUP_CLEANUP : SOUP_RECOVERY;
+        FILE *f = fopen(pending, "wb"); uint64_t hash; int writes = all_writes;
+        assert(f && fwrite("invalid!", 1, 8, f) == 8 && !fclose(f)); hash = file_hash(pending);
+        assert(soup_process_pair_with_settings(dir, "IMG_", 80, NULL, &off) == -2);
+        assert(all_writes == writes && file_hash(pending) == hash); assert(!remove(pending));
+    }
+    for (int k = 0; k < 8; k++) {
+        settings = off;
+        switch (k) {
+        case 0: settings.mode = -1; break;
+        case 1: settings.mode = 2; break;
+        case 2: settings.grain = 101; break;
+        case 3: settings.grain_size = 0; break;
+        case 4: settings.halation = -1; break;
+        case 5: settings.hal_radius = 9; break;
+        case 6: settings.bloom = 31; break;
+        default: settings.bloom_radius = 17; break;
+        }
+        { int writes = all_writes;
+            assert(soup_process_pair_with_settings(dir, "IMG_", 80, NULL, &settings) == -1 && all_writes == writes);
+        }
+    }
+    assert(file_hash("DCIM/100EOS5D/IMG_0080.JPG") == file_hash(jpeg)); assert_clean(&tx);
+    make_neutral_fixture("BW_SRC.JPG"); source_hash = file_hash("BW_SRC.JPG"); source_pixels = neutral_pixels("BW_SRC.JPG");
+    settings = (soup_settings){SOUP_MODE_EFFECTS, 30, 2, 60, 3, 15, 8}; saved = settings;
+    for (int k = 0; k < 3; k++) {
+        int number = k == 2 ? 82 : 81; uint64_t pixels;
+        snprintf(path, sizeof(path), "%s/IMG_%04d.JPG", dir, number); copy_file("BW_SRC.JPG", path);
+        snprintf(custom_originals[k].name, sizeof(custom_originals[k].name), "IMG_%04d.JPG", number);
+        custom_originals[k].hash = source_hash;
+        assert(soup_process_pair_with_settings(dir, "IMG_", number, NULL, &settings) == 1);
+        assert(!memcmp(&saved, &settings, sizeof(settings)));
+        assert(!soup_transaction_init(&tx, dir, "IMG_", number, 1)); assert_clean(&tx); check_jpeg_mode(path, 1);
+        pixels = neutral_pixels(path); assert(pixels != source_pixels);
+        assert(!soup_jpeg_metadata(path, &orientation, date) && orientation == 6 && !strcmp(date, "2026:01:02 03:04:05"));
+        if (!k) { same_capture = file_hash(path); first_pixels = pixels; }
+        else if (k == 1) assert(file_hash(path) == same_capture && pixels == first_pixels);
+        else assert(pixels != first_pixels);
+    }
+    printf("HYBRID_OUTPUTS_READY: synthetic BW_SRC.JPG -> DCIM/100EOS5D/IMG_0081.JPG; all-off colour DCIM/100EOS5D/IMG_0080.JPG\n");
+    fflush(stdout);
 }
 static void prepare_tx(soup_transaction *tx, int number, const char *jpeg, const char *raw)
 {
@@ -416,6 +563,36 @@ static void test_cleanup(const char *jpeg, const char *raw, se_stock *stock)
     assert_clean(&tx);
     puts("Temporary backups: publication guards, seven deletion cuts, reboot cleanup, partial records and ownership conflicts passed.");
 }
+static void test_checkpoints(const char *jpeg, se_stock *stock)
+{
+    static const char *labels[] = {"Status: backup ready", "Status: render ready", "Status: before commit"};
+    const char *dir = "DCIM/100EOS5D";
+    soup_transaction tx;
+    int found = 0;
+    copy_file(jpeg, "DCIM/100EOS5D/IMG_0090.JPG"); seed_report(512, 1);
+    checkpoint_count = 0; checkpoint_base_writes = indexed_writes; record_checkpoints = 1;
+    assert(soup_process_pair(dir, "IMG_", 90, stock) == 1); record_checkpoints = 0;
+    for (int i = 0; i < checkpoint_count && found < 3; i++)
+        if (strstr(checkpoint_reports[i].report, labels[found])) {
+            assert(checkpoint_reports[i].indexed == 0);
+            assert(strstr(checkpoint_reports[i].report, "Shot: 90\n")); found++;
+        }
+    assert(found == 3);
+    assert(report_has("Status: before commit") && report_has("Shot: 90\n"));
+    assert(!soup_transaction_init(&tx, dir, "IMG_", 90, 1)); assert_clean(&tx); check_jpeg(tx.files[0].source);
+    /* Checkpoint-report failure must not alter publication or cleanup. */
+    assert(!remove("ML/SOUP/DIAG.TXT")); seed_report(512, 1);
+    {
+        uint64_t report = file_hash("ML/SOUP/DIAG.TXT");
+        copy_file(jpeg, "DCIM/100EOS5D/IMG_0091.JPG");
+        write_fault = "ML/SOUP/DIAG.TXT"; write_budget = 0;
+        assert(soup_process_pair(dir, "IMG_", 91, stock) == 1); clear_faults();
+        assert(file_hash("ML/SOUP/DIAG.TXT") == report);
+        assert(!soup_transaction_init(&tx, dir, "IMG_", 91, 1)); assert_clean(&tx); check_jpeg(tx.files[0].source);
+    }
+    assert(!remove("ML/SOUP/DIAG.TXT"));
+    puts("Three ordered DIAG checkpoints precede indexed writes; report failure leaves publication unchanged.");
+}
 
 int main(int argc, char **argv)
 {
@@ -462,8 +639,10 @@ int main(int argc, char **argv)
                     soup_diag_fail("probe exclusive", -7);
                 }
                 soup_diag_phase("cleanup", 0);
+                soup_diag_phase("before commit", 0);
                 assert(strstr(soup_status_text(), "probe exclusive"));
                 snprintf(status_before, sizeof(status_before), "%s", soup_status_text());
+                soup_diag_note("late aggregate test note");
                 soup_diag_flush();
                 assert(!strcmp(status_before, soup_status_text()));
                 if (!k || k == 6) {
@@ -471,6 +650,7 @@ int main(int argc, char **argv)
                     size_t report_bytes;
                     uint8_t *report;
                     assert(report_has("probe exclusive"));
+                    assert(report_has("late aggregate test note"));
                     assert(!FIO_GetFileSize("ML/SOUP/DIAG.TXT", &bytes) && bytes == 512);
                     report = file_bytes("ML/SOUP/DIAG.TXT", &report_bytes);
                     assert(report_bytes == 512 && !memcmp(report, "SOUP_DIAGNOSTIC_V1\n", 19)); free(report);
@@ -502,9 +682,13 @@ int main(int argc, char **argv)
     }
     check_raw("DCIM/100EOS5D/IMG_0003.CR2", argv[1]);
     assert(file_hash("DCIM/100EOS5D/IMG_0003.CR2") != raw_hash && file_hash("DCIM/100EOS5D/IMG_0003.JPG") != jpeg_hash);
+    test_baseline();
+    test_hybrid(argv[1], argv[2]);
+    test_checkpoints(argv[2], &stock);
     printf("HAPPY_OUTPUTS_READY: %s\n", argv[4]); fflush(stdout);
     if (getenv("SOUP_HAPPY_ONLY")) return 0;
-    assert(!is_file("ML/SOUP/DIAG.TXT")); /* Fault budgets measure processing alone. */
+    assert(!is_file("ML/SOUP/DIAG.TXT"));
+    seed_report(512, 1); /* Exercise checkpoint I/O under the path-filtered fault budgets. */
 
     /* Interrupted pair commit, then repeated interrupted rollback. */
     prepare_tx(&tx, 20, argv[2], argv[1]);

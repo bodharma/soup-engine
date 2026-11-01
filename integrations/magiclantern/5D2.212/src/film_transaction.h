@@ -20,6 +20,26 @@
 #define SOUP_COMMIT_CLEANUP_PENDING 1
 #define SOUP_CLEANUP_DONE 2
 #define SOUP_CLEANUP_PENDING 3
+#define SOUP_MODE_EFFECTS 0
+#define SOUP_MODE_FILM 1
+
+typedef struct {
+    int mode, grain, grain_size, halation, hal_radius, bloom, bloom_radius;
+} soup_settings;
+
+typedef struct {
+    char directory[SOUP_PATH], prefix[5];
+    int number;
+    unsigned generation;
+} soup_capture_baseline;
+
+int soup_capture_arm(const char *, const char *, int);
+int soup_capture_snapshot(soup_capture_baseline *);
+void soup_capture_disable(void);
+int soup_capture_claim(unsigned generation);
+void soup_capture_release(void);
+void soup_get_settings(soup_settings *);
+int soup_develop_busy(void);
 
 typedef struct {
     char source[SOUP_PATH], backup[SOUP_PATH], stage[SOUP_PATH];
@@ -57,6 +77,7 @@ void soup_diag_begin(int number);
 void soup_diag_paths(const char *source, const char *backup, const char *stage);
 void soup_diag_phase(const char *phase, int rc);
 void soup_diag_fail(const char *phase, int rc);
+void soup_diag_note(const char *text);
 const char *soup_status_text(void);
 void soup_diag_flush(void);
 #endif

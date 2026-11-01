@@ -203,7 +203,7 @@ static void reference(const se_look *lk, const uint8_t *in, int w, int h,
             /* Halation only shows bleeding into something darker: where
              * the emulsion is already saturated a second exposure adds
              * nothing. Weight by the headroom left in the destination. */
-            a = (a * (255 - luma8(out[(y*w+x)*3+0], out[(y*w+x)*3+1],
+            a = (a * (255 - luma(out[(y*w+x)*3+0], out[(y*w+x)*3+1],
                                   out[(y*w+x)*3+2]))) / 255;
             if (a <= 0) continue;
             for (c = 0; c < 3; c++)
@@ -234,6 +234,7 @@ typedef struct { uint8_t *buf; int w, rows, cap; } sink;
 static int on_row(void *ctx, const uint8_t *row, int w)
 {
     sink *s = (sink *)ctx;
+    if (w != s->w) { fprintf(stderr, "emitted wrong width\n"); exit(1); }
     if (s->rows >= s->cap) { fprintf(stderr, "emitted too many rows\n"); exit(1); }
     memcpy(s->buf + (size_t)s->rows*w*3, row, (size_t)w*3);
     s->rows++;
@@ -281,6 +282,119 @@ static int run_case(const char *what, const se_look *lk,
     return 0;
 }
 
+static int effects_run(const se_effects *effects, uint32_t seed, const uint8_t *in,
+                       int w, int h, int chunk, uint8_t *out)
+{
+    se_look lk;
+    se_look_run *run = NULL;
+    se_arena arena;
+    sink sk = {out, w, 0, h};
+    size_t bytes;
+    uint8_t *memory;
+    int ok = 1;
+    if (se_look_from_effects(effects, seed, &lk) != SE_OK) return 0;
+    bytes = se_look_bytes(&lk, w); memory = malloc(bytes + 32);
+    if (!memory) return 0;
+    memset(memory, 0xa5, bytes + 32); se_arena_init(&arena, memory, bytes);
+    if (se_look_begin(&run, &lk, w, &arena) != SE_OK) ok = 0;
+    for (int y = 0; ok && y < h; y += chunk) {
+        int n = h - y < chunk ? h - y : chunk;
+        if (se_look_rows(run, in + (size_t)y * w * 3, n, on_row, &sk) != SE_OK) ok = 0;
+    }
+    if (ok && se_look_end(run, on_row, &sk) != SE_OK) ok = 0;
+    if (sk.rows != h) ok = 0;
+    for (int i = 0; i < 32; i++) if (memory[bytes + i] != 0xa5) ok = 0;
+    free(memory); return ok;
+}
+
+static int effects_off_identity(void)
+{
+    enum { W = 61, H = 19 };
+    uint8_t in[W * H * 3], out[W * H * 3];
+    se_effects effects = {0, 1, 0, 1, 0, 1};
+    int i;
+    for (i = 0; i < (int)sizeof(in); i++) in[i] = (uint8_t)((i * 37 + i / 7) & 255);
+    if (!effects_run(&effects, 123, in, W, H, 1, out)) return 1;
+    for (i = 0; i < (int)sizeof(in); i++) if (in[i] != out[i]) {
+        printf("  effects-only OFF must preserve RGB: byte %d got %u, expected %u\n", i, out[i], in[i]);
+        return 1;
+    }
+    printf("  effects-only OFF preserves varied RGB exactly\n");
+    return 0;
+}
+
+static int effects_behaviour(void)
+{
+    enum { W = 41, H = 29, N = W * H * 3 };
+    uint8_t in[N], a[N], b[N], c[N];
+    se_effects off = {0, 1, 0, 1, 0, 1}, e;
+    se_look lk;
+    int changed;
+    #define FX_CHECK(test, message) do { if (!(test)) { printf("  effects: %s FAILED\n", message); return 1; } } while (0)
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        int v = x >= 18 && x <= 22 && y >= 12 && y <= 16 ? 255 : 96;
+        in[(y * W + x) * 3] = in[(y * W + x) * 3 + 1] = in[(y * W + x) * 3 + 2] = (uint8_t)v;
+    }
+    e = off; e.grain = 40; e.grain_cell = 2;
+    FX_CHECK(effects_run(&e, 1001, in, W, H, 1, a), "grain render");
+    FX_CHECK(effects_run(&e, 1001, in, W, H, 7, b) && !memcmp(a, b, N), "capture/chunk repeatability");
+    FX_CHECK(effects_run(&e, 1002, in, W, H, H, c) && memcmp(a, c, N), "capture seed variation");
+    FX_CHECK(memcmp(a, in, N), "grain must be visible");
+    e.grain_cell = 5;
+    FX_CHECK(effects_run(&e, 1001, in, W, H, 3, b) && memcmp(a, b, N), "grain size must matter");
+    e.grain = 0;
+    FX_CHECK(effects_run(&e, 9999, in, W, H, 7, b) && !memcmp(in, b, N), "zero grain disables seed/size");
+    for (int effect = 0; effect < 2; effect++) {
+        e = off;
+        if (effect) { e.bloom_amount = 30; e.bloom_radius = 8; }
+        else { e.hal_amount = 100; e.hal_radius = 8; }
+        FX_CHECK(effects_run(&e, 1, in, W, H, 1, a), "neutral glow render");
+        changed = 0;
+        for (int i = 0; i < N; i += 3) {
+            FX_CHECK(a[i] == a[i + 1] && a[i] == a[i + 2], "glow must stay neutral");
+            if (in[i] == 96 && a[i] > 96) changed++;
+        }
+        FX_CHECK(changed > 0, "glow must affect bright-patch neighbourhood");
+        if (effect) e.bloom_radius = 1; else e.hal_radius = 1;
+        FX_CHECK(effects_run(&e, 1, in, W, H, 7, b) && memcmp(a, b, N), "glow size must matter");
+        FX_CHECK(a[(14 * W + 26) * 3] > in[(14 * W + 26) * 3] &&
+                 b[(14 * W + 26) * 3] == in[(14 * W + 26) * 3], "larger radius reaches farther");
+    }
+    e = (se_effects){35, 2, 70, 3, 20, 8};
+    FX_CHECK(effects_run(&e, 42, in, W, H, 1, a), "combined render");
+    FX_CHECK(effects_run(&e, 42, in, W, H, 11, b) && !memcmp(a, b, N), "combined chunk invariance");
+    for (int i = 0; i < N; i += 3) FX_CHECK(a[i] == a[i + 1] && a[i] == a[i + 2], "combined neutrality");
+    e.hal_amount = 0; e.hal_radius = 1;
+    FX_CHECK(effects_run(&e, 42, in, W, H, 3, a), "zero halo render");
+    e.hal_radius = 8;
+    FX_CHECK(effects_run(&e, 42, in, W, H, 7, b) && !memcmp(a, b, N), "zero halo independent of radius");
+    e.hal_amount = 70; e.bloom_amount = 0; e.bloom_radius = 1;
+    FX_CHECK(effects_run(&e, 42, in, W, H, 3, a), "zero bloom render");
+    e.bloom_radius = 16;
+    FX_CHECK(effects_run(&e, 42, in, W, H, 7, b) && !memcmp(a, b, N), "zero bloom independent of radius");
+    e = (se_effects){100, 5, 100, 8, 30, 16};
+    FX_CHECK(se_look_from_effects(&e, 0, &lk) == SE_OK &&
+             se_look_bytes(&lk, 4080) <= SE_EFFECTS_BUDGET, "native bounded memory cost");
+    FX_CHECK(effects_run(&e, 0, in, W, H, H, a), "maximum settings");
+    FX_CHECK(effects_run(&e, 0, in, 1, 1, 1, a), "tiny frame with large radii");
+    FX_CHECK(se_look_from_effects(NULL, 1, &lk) != SE_OK && se_look_from_effects(&off, 1, NULL) != SE_OK, "null bounds");
+    for (int field = 0; field < 6; field++) for (int high = 0; high < 2; high++) {
+        e = off;
+        switch (field) {
+        case 0: e.grain = high ? 101 : -1; break;
+        case 1: e.grain_cell = high ? 6 : 0; break;
+        case 2: e.hal_amount = high ? 101 : -1; break;
+        case 3: e.hal_radius = high ? 9 : 0; break;
+        case 4: e.bloom_amount = high ? 31 : -1; break;
+        default: e.bloom_radius = high ? 17 : 0; break;
+        }
+        FX_CHECK(se_look_from_effects(&e, 1, &lk) != SE_OK, "settings outside supported bounds");
+    }
+    printf("  effects-only neutrality, neighbourhoods, zero amounts, seeds, chunks and bounds pass\n");
+    #undef FX_CHECK
+    return 0;
+}
+
 int main(void)
 {
     int      w = 61, h = 37, x, y, fails = 0, ci;
@@ -299,6 +413,8 @@ int main(void)
     }
 
     printf("lookcheck: streaming look vs a whole-image reference\n");
+    fails += effects_off_identity();
+    fails += effects_behaviour();
 
     for (ci = 0; ci < (int)(sizeof chunks/sizeof *chunks); ci++) {
         int c = chunks[ci];

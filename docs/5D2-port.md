@@ -6,13 +6,22 @@ camera playback images after processing. A manually prepared styled frame has
 displayed correctly in Canon PLAY. The automatic processing, recovery and
 temporary-file cleanup paths still need camera testing.
 
+The [B&W JPEG experiment](5D2-bw-experiment.md) adds an effects-only mode:
+Canon Picture Style handles colour/tone, and Soup adds adjustable grain,
+neutral halation and bloom. Existing Film stock mode remains available.
+The first experiment targets native Monochrome JPEG capture; effects-only
+does not repeat Soup's stock colour grade.
+
 ## Shooting and playback
 
 1. Highlight `Shoot → Soup Film` and press SET to open its controls. `Enable`
    starts OFF on every boot; set it ON before taking a new photo. `Stock` opens
    the film-name picker. On the 5D Mark II, Pict.Style returns from that picker
-   to the Enable/Stock controls. Classic Chrome is the initial stock. Use sRGB
-   and a colour Canon Picture Style; a monochrome source cannot regain colour.
+   to the controls. Effects only is the initial processing mode. The explicit
+   B&W test action selects Canon Monochrome; normal Enable leaves the selected
+   Picture Style alone. Film stock mode retains the existing stock picker
+   (Classic Chrome is the initial stock). For Film stock mode use sRGB and a
+   colour Canon Picture Style; a monochrome source cannot regain colour.
 2. Full RAW uses its embedded JPEG; JPEG-only uses the camera JPEG. RAW+JPEG
    prefers the JPEG and applies one look to both the indexed JPEG and the
    CR2's main JPEG preview and thumbnail.
@@ -34,6 +43,12 @@ temporary-file cleanup paths still need camera testing.
    camera decoding and processing time still require hardware testing.
 
 ## File updates and recovery
+
+The worker uses Magic Lantern's standard prohibit/permit pair around each
+processing attempt to protect long jobs from Canon's automatic power-off.
+The property requests are asynchronous; this is not a guarantee against
+power interruption. Guarded diagnostic checkpoints are written after backup,
+after rendering and before commit, with a compact final timing summary.
 
 Soup first waits for Canon's capture job to become idle and for both possible
 source sizes to remain unchanged for one second. Before creating backups it

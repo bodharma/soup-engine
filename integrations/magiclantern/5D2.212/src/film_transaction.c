@@ -82,6 +82,11 @@ void soup_diag_fail(const char *phase, int rc)
     }
 }
 
+void soup_diag_note(const char *text)
+{
+    soup_diag_event("%s\n", text);
+}
+
 /* Only this pre-existing owned report may be updated; logger errors are ignored. */
 void soup_diag_flush(void)
 {

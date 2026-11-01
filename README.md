@@ -3,7 +3,10 @@
 # 🎞️ Soup Engine <sub><sup>beta</sup></sub>
 
 > **Experimental EOS 5D Mark II port (Canon firmware 2.1.2):**
-> keeps verified temporary originals until the existing JPEG or RAW playback
+> adds an effects-only B&W JPEG experiment: Canon Picture Style supplies
+> tone, with adjustable Soup grain, neutral halation and bloom. See the
+> [B&W experiment guide](docs/5D2-bw-experiment.md).
+> It keeps verified temporary originals until the existing JPEG or RAW playback
 > previews are updated successfully, then removes its temporary photo files.
 > See [the port notes](docs/5D2-port.md) for supported RAW/JPEG modes, recovery,
 > cleanup and local builds. A manually prepared styled image displays in Canon

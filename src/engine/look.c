@@ -274,6 +274,22 @@ void se_look_from_stock(const se_stock *s, int scale, se_look *lk)
     for (c = 0; c < 3; c++) lk->hal_tint[c] = clamp8((int)s->hal_tint[c]);
 }
 
+se_err se_look_from_effects(const se_effects *fx, uint32_t seed, se_look *lk)
+{
+    if (!fx || !lk || fx->grain < 0 || fx->grain > 100 ||
+        fx->grain_cell < 1 || fx->grain_cell > 5 ||
+        fx->hal_amount < 0 || fx->hal_amount > 100 || fx->hal_radius < 1 || fx->hal_radius > 8 ||
+        fx->bloom_amount < 0 || fx->bloom_amount > 30 || fx->bloom_radius < 1 || fx->bloom_radius > 16)
+        return SE_E_CORRUPT;
+    memset(lk, 0, sizeof(*lk));
+    lk->effects_only = 1;
+    lk->grain = fx->grain; lk->grain_cell = fx->grain_cell; lk->grain_seed = seed;
+    lk->hal_amount = fx->hal_amount; lk->hal_radius = fx->hal_radius; lk->hal_thresh = 224;
+    lk->hal_tint[0] = lk->hal_tint[1] = lk->hal_tint[2] = 255;
+    lk->bloom_amount = fx->bloom_amount; lk->bloom_radius = fx->bloom_radius; lk->bloom_thresh = 208;
+    return SE_OK;
+}
+
 /* ------------------------------------------------------- the run ----- */
 
 struct se_look_run {
@@ -292,9 +308,10 @@ struct se_look_run {
     uint8_t *scratch;         /* one row of mask, pre-blur               */
 
     uint8_t *flat;            /* !on only: the one row we grade into     */
+    se_look_run *bloom;       /* optional second neutral blur, before grain */
 };
 
-size_t se_look_bytes(const se_look *lk, int width)
+static size_t look_single_bytes(const se_look *lk, int width)
 {
     size_t n;
     if (lk->hal_amount <= 0)
@@ -307,9 +324,33 @@ size_t se_look_bytes(const se_look *lk, int width)
     return n + 64;
 }
 
+static void bloom_look(const se_look *lk, se_look *bloom)
+{
+    *bloom = *lk;
+    bloom->hal_amount = lk->bloom_amount;
+    bloom->hal_radius = lk->bloom_radius;
+    bloom->hal_thresh = lk->bloom_thresh;
+    bloom->hal_tint[0] = bloom->hal_tint[1] = bloom->hal_tint[2] = 255;
+    bloom->bloom_amount = 0;
+}
+
+size_t se_look_bytes(const se_look *lk, int width)
+{
+    size_t bytes = look_single_bytes(lk, width);
+    if (lk->effects_only && lk->bloom_amount > 0) {
+        se_look bloom;
+        bloom_look(lk, &bloom);
+        bytes += look_single_bytes(&bloom, width) + 32;
+    }
+    return bytes;
+}
+
 size_t se_look_fit(se_look *lk, int width, size_t budget)
 {
     size_t n = se_look_bytes(lk, width);
+
+    /* Effects controls are literal: caller must allocate or reject, never shrink. */
+    if (lk->effects_only) return n;
 
     while (lk->hal_amount > 0 && lk->hal_radius > 1 && n > budget) {
         lk->hal_radius--;
@@ -342,7 +383,7 @@ se_err se_look_begin(se_look_run **out, const se_look *lk,
      * looking for an off-by-one in the reciprocal. Every consumer has to
      * come through here, so this is where it belongs.
      */
-    tables_init();
+    if (!lk->effects_only) tables_init();
 
     r = SE_NEW(ar, se_look_run, 1);
     if (!r) return SE_E_NOMEM;
@@ -375,6 +416,14 @@ se_err se_look_begin(se_look_run **out, const se_look *lk,
     } else {
         r->flat = SE_NEW(ar, uint8_t, (size_t)width * 3);
         if (!r->flat) return SE_E_NOMEM;
+    }
+    if (lk->effects_only && lk->bloom_amount > 0) {
+        se_look bloom;
+        se_err e;
+        bloom_look(lk, &bloom);
+        e = se_look_begin(&r->bloom, &bloom, width, ar);
+        if (e != SE_OK) return e;
+        r->lk.grain = 0; /* the final run adds grain once, after both glows */
     }
     *out = r;
     return SE_OK;
@@ -574,7 +623,7 @@ static void grain_row(const se_look *lk, uint8_t *row, int w, int y)
     if (amp <= 0) return;
     for (x = 0; x < w; x++) {
         int n = (int)(grain_hash((unsigned)(x / cell), (unsigned)(y / cell),
-                                 0x5EEDu) & 0xFFFF);
+                                 lk->effects_only ? lk->grain_seed : 0x5EEDu) & 0xFFFF);
         int d = ((n - 32768) * amp) >> 15;
         int c;
         for (c = 0; c < 3; c++) {
@@ -592,6 +641,7 @@ static se_err emit_one(se_look_run *r, uint8_t *dst,
 {
     if (r->lk.grain > 0) grain_row(&r->lk, dst, r->w, r->y_out);
     r->y_out++;
+    if (r->bloom) return se_look_rows(r->bloom, dst, 1, emit, ctx);
     return emit(ctx, dst, r->w) == 0 ? SE_OK : SE_E_IO;
 }
 
@@ -637,7 +687,7 @@ static se_err push_row(se_look_run *r, const uint8_t *src,
         for (x = 0; x < w; x++) r->colsum[x] -= msk[x];
 
     memcpy(dly, src, (size_t)w * 3);
-    grade_row(&r->lk, dly, w);
+    if (!r->lk.effects_only) grade_row(&r->lk, dly, w);
     mask_row(&r->lk, dly, w, r->scratch, msk);
 
     for (x = 0; x < w; x++) r->colsum[x] += msk[x];
@@ -674,7 +724,7 @@ se_err se_look_rows(se_look_run *r, const uint8_t *rgb, int nrows,
              * The caller's rows are const and may be the decoder's own
              * scratch, so the grade lands in our row, never in theirs. */
             memcpy(r->flat, src, (size_t)r->w * 3);
-            grade_row(&r->lk, r->flat, r->w);
+            if (!r->lk.effects_only) grade_row(&r->lk, r->flat, r->w);
             e = emit_one(r, r->flat, emit, ctx);
             if (e != SE_OK) return e;
             continue;
@@ -702,7 +752,8 @@ se_err se_look_end(se_look_run *r, se_look_emit emit, void *ctx)
     se_err e;
 
     if (!r || !emit) return SE_E_CORRUPT;
-    if (!r->on || r->pushed == 0) return SE_OK;
+    if (!r->on || r->pushed == 0)
+        return r->bloom ? se_look_end(r->bloom, emit, ctx) : SE_OK;
 
     w = r->w;
 
@@ -726,5 +777,5 @@ se_err se_look_end(se_look_run *r, se_look_emit emit, void *ctx)
         e = emit_delayed(r, r->pushed - 1, emit, ctx);
         if (e != SE_OK) return e;
     }
-    return SE_OK;
+    return r->bloom ? se_look_end(r->bloom, emit, ctx) : SE_OK;
 }

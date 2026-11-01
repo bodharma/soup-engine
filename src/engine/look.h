@@ -136,7 +136,23 @@ typedef struct {
      * on the only path the camera has ever finished a frame on. */
     int      grain;          /* 0..100, 0 = none                         */
     int      grain_cell;     /* 1..9 pixels at full size                 */
+
+    /* Explicit spatial-only path: grade_row is completely bypassed. */
+    int      effects_only;
+    uint32_t grain_seed;
+    int      bloom_amount, bloom_thresh, bloom_radius;
 } se_look;
+
+/* Sizes are output pixels. Bloom is deliberately limited to a subtle gain. */
+typedef struct {
+    int grain, grain_cell;              /* 0..100, 1..5 */
+    int hal_amount, hal_radius;         /* 0..100, 1..8 */
+    int bloom_amount, bloom_radius;     /* 0..30, 1..16 */
+} se_effects;
+
+/* Neutral glow; zero amounts give exact RGB identity, without stock grading. */
+se_err se_look_from_effects(const se_effects *effects, uint32_t seed, se_look *lk);
+#define SE_EFFECTS_BUDGET (768 * 1024)
 
 /* Resolve a stock into the above. `scale` is the decode scale (1, 2 or 4):
  * grain and halation are in output pixels, so both shrink with the image
